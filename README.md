@@ -1,9 +1,10 @@
 SkY Touch 🎯✨
 > An elegant, interactive notch gesture assistant with Side Deck quick access panels, OTP code detectors, and system-wide Text Assistant & AI Snippets powered by Gemini.
 > 
-📸 App Screenshots
+📸 **App Screenshots:**
 HOW TO ADD I DON'T KNOW 
-|  |  |  |
+
+
 🌟 Overview
 SkY Touch is an advanced Android utility and accessibility application built with Jetpack Compose. It transforms your phone’s camera cutout (notch or hole-punch) into an interactive shortcut hub. By leveraging Android's Accessibility Services, SkY Touch empowers users with custom gesture controls, instant 2FA/OTP code interception, a floating edge side deck, and smart AI text assistance across any app.
 🚀 Key Features
