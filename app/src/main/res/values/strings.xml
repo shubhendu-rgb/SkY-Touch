@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">SkY Touch</string>
+    <string name="accessibility_service_description">SkY Touch detects clicks, double clicks, and swipes near your camera cutout to trigger fast system actions like screenshots, flashlight, back key, etc.</string>
+</resources>

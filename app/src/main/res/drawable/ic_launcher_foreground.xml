@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Outer glowing tech ring -->
+    <path
+        android:pathData="M 54,24 A 30,30 0 1,1 53.9,24 Z"
+        android:strokeColor="#E53935"
+        android:strokeWidth="1.5"
+        android:fillColor="#00000000"
+        android:strokeLineCap="round"/>
+
+    <!-- Dotted swipe indicators (Left/Right) -->
+    <path
+        android:pathData="M 14,54 L 20,54"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="2.5"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000"/>
+    <path
+        android:pathData="M 88,54 L 94,54"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="2.5"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000"/>
+
+    <!-- Tap center target (glowing camera cutout overlay representation) -->
+    <path
+        android:pathData="M 54,42 A 12,12 0 1,1 53.9,42 Z"
+        android:fillColor="#E53935"/>
+
+    <!-- Tiny lens reflection (cx=51, cy=49, r=3) -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M 51,49 m -3,0 a 3,3 0 1,1 6,0 a 3,3 0 1,1 -6,0" />
+
+    <!-- Wave/Finger touch path gesture vector representation -->
+    <path
+        android:pathData="M 40,64 C 40,64 50,72 54,72 C 58,72 68,64 68,64"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="3"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000"/>
+
+    <!-- Double touch indicators -->
+    <!-- Left touch circle (cx=36, cy=42, r=2) -->
+    <path
+        android:fillColor="#E53935"
+        android:pathData="M 36,42 m -2,0 a 2,2 0 1,1 4,0 a 2,2 0 1,1 -4,0" />
+    
+    <!-- Right touch circle (cx=72, cy=42, r=2) -->
+    <path
+        android:fillColor="#E53935"
+        android:pathData="M 72,42 m -2,0 a 2,2 0 1,1 4,0 a 2,2 0 1,1 -4,0" />
+</vector>

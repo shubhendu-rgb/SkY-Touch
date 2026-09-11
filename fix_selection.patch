@@ -1,0 +1,24 @@
+--- app/src/main/java/com/example/service/NotchAccessibilityService.kt
++++ app/src/main/java/com/example/service/NotchAccessibilityService.kt
+@@ -393,10 +393,6 @@
+             val setTextSuccess = targetNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+ 
+             // Reposition cursor to end of text
+-            val selectArgs = Bundle().apply {
+-                putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, newText.length)
+-                putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, newText.length)
+-            }
+ 
+             // 2. Fallback for messaging apps that suppress ACTION_SET_TEXT (WhatsApp, Signal, Telegram)
+             if (!setTextSuccess) {
+@@ -415,10 +411,6 @@
+             clipboard.setPrimaryClip(clip)
+ 
+             // Select all in field
+-            val selectAllArgs = Bundle().apply {
+-                putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, 0)
+-                putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, Int.MAX_VALUE)
+-            }
+ 
+             // Dispatch Paste
+             val pasteSuccess = node.performAction(AccessibilityNodeInfo.ACTION_PASTE)

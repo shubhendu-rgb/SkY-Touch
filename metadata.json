@@ -1,0 +1,6 @@
+{
+  "name": "SkY Touch",
+  "description": "An elegant, interactive notch gesture assistant with Side Deck quick access panel, OTP code detector, and system-wide Text Assistant & AI Snippets powered by Gemini.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
