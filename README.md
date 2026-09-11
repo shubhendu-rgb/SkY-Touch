@@ -2,8 +2,6 @@ SkY Touch 🎯✨
 > An elegant, interactive notch gesture assistant with Side Deck quick access panels, OTP code detectors, and system-wide Text Assistant & AI Snippets powered by Gemini.
 > 
 📸 App Screenshots
-| Dashboard Interface | Navigation Drawer | About Developer |
-|---|---|---| 
 HOW TO ADD I DON'T KNOW 
 |  |  |  |
 🌟 Overview
