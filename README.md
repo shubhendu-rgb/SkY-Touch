@@ -1,4 +1,22 @@
-SkY Touch 🎯✨
+
+**Notice Regarding App Installation**
+
+We sincerely apologize for the inconvenience you may be experiencing while trying to install our application. Currently, Google Play Protect is flagging the app and blocking the installation process. This frequently happens with newly released applications or direct downloads that are not yet fully indexed by Google's security systems, even when the software is completely safe.
+
+Please be assured that our app is secure and free of any malicious software. To complete your installation, you can temporarily bypass this block by adjusting your Play Store settings.
+
+**How to Temporarily Disable Google Play Protect**
+
+1. Open the **Google Play Store** app on your Android device.
+2. Tap your **profile icon** located in the top right corner of the screen.
+3. Select **Play Protect** from the menu options.
+4. Tap the **Settings gear icon** in the top right corner of the Play Protect screen.
+5. Toggle off the switch next to **Scan apps with Play Protect**.
+6. Tap **Turn off** to confirm your decision when the system prompt appears.
+7. Proceed to install our application.
+8. Once the installation is complete, return to these settings and toggle Play Protect back on to ensure your device remains protected from external threats.
+
+**SkY Touch 🎯✨**
 > An elegant, interactive notch gesture assistant with Side Deck quick access panels, OTP code detectors, and system-wide Text Assistant & AI Snippets powered by Gemini.
 > 
 📸 **App Screenshots:**
