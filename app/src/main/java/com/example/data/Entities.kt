@@ -90,7 +90,7 @@ data class DetectedCodeEntity(
 data class TextAssistantConfigEntity(
     @PrimaryKey val id: Int = 1,
     val enabled: Boolean = true,
-    val apiKey: String = "", // Manual user override; falls back to BuildConfig.GEMINI_API_KEY
+    val apiKey: String = "", // User provided Gemini API key
     val modelName: String = "gemini-2.0-flash", // Selected Gemini model
     val triggerPrefix: String = "?", // e.g. '?', '!', '/', '#'
     val hapticFeedback: Boolean = true,

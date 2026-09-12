@@ -35,7 +35,6 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.example.BuildConfig
 import com.example.data.TextAssistantConfigEntity
 import com.example.data.TextSnippetEntity
 import com.example.service.NotchAccessibilityService
@@ -397,7 +396,7 @@ fun TextAssistantTab(
                 var apiKeyInput by remember(config.apiKey) { mutableStateOf(config.apiKey) }
 
                 val effectiveKey = GeminiTextHelper.getEffectiveApiKey(config.apiKey)
-                val isUsingDefaultKey = config.apiKey.isBlank() && effectiveKey.isNotBlank()
+                val hasKey = effectiveKey.isNotBlank()
 
                 Column(
                     modifier = Modifier.padding(20.dp),
@@ -420,7 +419,7 @@ fun TextAssistantTab(
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
-                                text = "Powered by Google Gemini 2.5 Flash",
+                                text = "Bring Your Own Key • Powered by Google Gemini",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -430,25 +429,22 @@ fun TextAssistantTab(
                     // Key status badge
                     Surface(
                         shape = RoundedCornerShape(8.dp),
-                        color = when {
-                            isUsingDefaultKey -> MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.5f)
-                            effectiveKey.isNotBlank() -> MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.5f)
-                            else -> MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.5f)
-                        }
+                        color = if (hasKey)
+                            MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f)
+                        else
+                            MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.5f)
                     ) {
                         Text(
-                            text = when {
-                                isUsingDefaultKey -> "Using Pre-configured Gemini API Key"
-                                effectiveKey.isNotBlank() -> "Using Custom Gemini API Key"
-                                else -> "No API Key configured. Please enter your Gemini API Key below."
-                            },
+                            text = if (hasKey)
+                                "Active • Custom API Key Configured"
+                            else
+                                "API Key Required • Enter your Gemini API Key below",
                             style = MaterialTheme.typography.labelMedium,
                             fontWeight = FontWeight.Medium,
-                            color = when {
-                                isUsingDefaultKey -> MaterialTheme.colorScheme.onTertiaryContainer
-                                effectiveKey.isNotBlank() -> MaterialTheme.colorScheme.onSecondaryContainer
-                                else -> MaterialTheme.colorScheme.onErrorContainer
-                            },
+                            color = if (hasKey)
+                                MaterialTheme.colorScheme.onPrimaryContainer
+                            else
+                                MaterialTheme.colorScheme.onErrorContainer,
                             modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
                         )
                     }
@@ -459,8 +455,11 @@ fun TextAssistantTab(
                         onValueChange = {
                             apiKeyInput = it
                         },
-                        label = { Text("Custom Gemini API Key (Optional)") },
-                        placeholder = { Text("AIzaSy...") },
+                        label = { Text("Gemini API Key") },
+                        placeholder = { Text("Paste your API key (AIzaSy...)") },
+                        supportingText = {
+                            Text("Get your free API key at https://aistudio.google.com/")
+                        },
                         singleLine = true,
                         trailingIcon = {
                             Row(
@@ -468,15 +467,15 @@ fun TextAssistantTab(
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 if (apiKeyInput.isNotEmpty()) {
-                                    Button(onClick = {
+                                    IconButton(onClick = {
                                         apiKeyInput = ""
                                         viewModel.updateTextAssistantConfig(config.copy(apiKey = ""))
                                     }) {
                                         Icon(Icons.Filled.Clear, contentDescription = "Clear")
                                     }
                                 }
-                                Button(onClick = { 
-                                    viewModel.updateTextAssistantConfig(config.copy(apiKey = apiKeyInput))
+                                IconButton(onClick = { 
+                                    viewModel.updateTextAssistantConfig(config.copy(apiKey = apiKeyInput.trim()))
                                 }) {
                                     Icon(
                                         imageVector = Icons.Filled.Check,

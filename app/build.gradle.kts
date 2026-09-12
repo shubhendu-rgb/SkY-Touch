@@ -5,7 +5,7 @@ plugins {
   alias(libs.plugins.kotlin.compose)
   alias(libs.plugins.google.devtools.ksp)
   alias(libs.plugins.roborazzi)
-  alias(libs.plugins.secrets)
+  // alias(libs.plugins.secrets)
   // alias(libs.plugins.google.services)
 }
 
@@ -48,8 +48,8 @@ android {
       signingConfig = signingConfigs.getByName("release")
     }
     debug {
-      isMinifyEnabled = true
-      isShrinkResources = true
+      isMinifyEnabled = false
+      isShrinkResources = false
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
       signingConfig = signingConfigs.getByName("debugConfig")
     }
@@ -60,7 +60,7 @@ android {
   }
   buildFeatures {
     compose = true
-    buildConfig = true
+    buildConfig = false
   }
   testOptions { unitTests { isIncludeAndroidResources = true } }
   dependenciesInfo {
@@ -71,11 +71,11 @@ android {
 
 // Configure the Secrets Gradle Plugin to use .env and .env.example files
 // to match the convention used in Web projects.
-secrets {
-  propertiesFileName = ".env"
-  defaultPropertiesFileName = ".env.example"
-  ignoreList.add("FIREBASE_APPCHECK_DEBUG_TOKEN")
-}
+// secrets {
+//   propertiesFileName = ".env"
+//   defaultPropertiesFileName = ".env.example"
+//   ignoreList.add("FIREBASE_APPCHECK_DEBUG_TOKEN")
+// }
 
 // googleServices { missingGoogleServicesStrategy = MissingGoogleServicesStrategy.WARN }
 

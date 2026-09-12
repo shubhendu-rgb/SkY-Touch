@@ -1,7 +1,6 @@
 package com.example.util
 
 import android.util.Log
-import com.example.BuildConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -23,15 +22,7 @@ object GeminiTextHelper {
         .build()
 
     fun getEffectiveApiKey(customApiKey: String?): String {
-        val trimmed = customApiKey?.trim().orEmpty()
-        if (trimmed.isNotEmpty()) {
-            return trimmed
-        }
-        return try {
-            BuildConfig.GEMINI_API_KEY
-        } catch (_: Exception) {
-            ""
-        }
+        return customApiKey?.trim().orEmpty()
     }
 
     suspend fun transformText(
@@ -43,7 +34,7 @@ object GeminiTextHelper {
         val effectiveKey = getEffectiveApiKey(apiKey)
         if (effectiveKey.isEmpty()) {
             return@withContext Result.failure(
-                IllegalStateException("Gemini API key is missing. Please set your API key in Settings or AI Studio Secrets.")
+                IllegalStateException("Gemini API key is required. Please enter your Gemini API key in Text Assistant settings.")
             )
         }
 
