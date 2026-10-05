@@ -44,6 +44,20 @@ SkY Touch is an advanced Android utility and accessibility application built wit
 5. ⚙️ Robust Customization & Backup
  * Excluded Apps: Select specific applications (like full-screen games or video players) where gestures and overlays should be temporarily hidden.
  * Backup & Restore: Export all custom gesture configurations, snippets, and app settings into a portable JSON file to sync across devices.
+6. 👆 Auto Clicker
+Automate repetitive tapping and clicking tasks on your device with precision and ease.
+
+* **Custom Intervals & Timers:** Define exact delays (milliseconds to hours) between consecutive clicks.
+* **Target Coordinates:** Select specific screen locations or configure multi-point click sequences.
+* **Flexible Repeat Options:** Set clicks to run indefinitely, for a fixed count, or on a timed duration.
+* **Background & Floating Controls:** Easily start, pause, or adjust click settings using an on-screen overlay control panel.
+7. 🖼️ Auto Wallpaper Changer
+* Keep your home and lock screens fresh by automatically updating your wallpapers on your schedule.
+
+* **Custom Timers & Schedules:** Change wallpapers at fixed time intervals (e.g., every 15 minutes, daily, or on device unlock).
+* **Dynamic Triggers:** Automatically switch wallpapers based on system theme (Light/Dark mode), weather changes, or time of day.
+* **Flexible Sources:** Cycle through local photo folders or pull high-resolution images from online collections (e.g., Unsplash, Bing Daily Picture).
+* **Category Filters:** Filter wallpapers by custom tags, albums, or aesthetics (such as Nature, Minimalist, or Abstract).
 🛠️ Tech Stack & Architecture
  * UI Framework: 100% Jetpack Compose with Material 3 design and dynamic color support.
  * Architecture: MVVM (Model-View-ViewModel) pattern with Kotlin Coroutines and Flows.
