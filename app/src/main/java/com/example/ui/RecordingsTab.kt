@@ -31,6 +31,9 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
@@ -40,6 +43,7 @@ fun RecordingsTab(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var recordings by remember { mutableStateOf<List<File>>(emptyList()) }
     var isRefreshing by remember { mutableStateOf(false) }
 
@@ -62,40 +66,45 @@ fun RecordingsTab(
 
     fun refreshRecordings() {
         isRefreshing = true
-        val list = mutableListOf<File>()
-        
-        // Scan public DCIM directory
-        try {
-            val dcimDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM)
-            val spyCamDirPublic = File(dcimDir, "spy cam")
-            if (spyCamDirPublic.exists() && spyCamDirPublic.isDirectory) {
-                spyCamDirPublic.listFiles()?.forEach { file ->
-                    if (file.isFile && file.extension.lowercase() == "mp4") {
-                        list.add(file)
+        scope.launch(Dispatchers.IO) {
+            val list = mutableListOf<File>()
+            
+            // Scan public DCIM directory
+            try {
+                val dcimDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM)
+                val spyCamDirPublic = File(dcimDir, "spy cam")
+                if (spyCamDirPublic.exists() && spyCamDirPublic.isDirectory) {
+                    spyCamDirPublic.listFiles()?.forEach { file ->
+                        if (file.isFile && file.extension.lowercase() == "mp4") {
+                            list.add(file)
+                        }
                     }
                 }
+            } catch (e: Exception) {
+                e.printStackTrace()
             }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
 
-        // Scan app-specific files directory
-        try {
-            val spyCamDirPrivate = File(context.getExternalFilesDir(null), "spy cam")
-            if (spyCamDirPrivate.exists() && spyCamDirPrivate.isDirectory) {
-                spyCamDirPrivate.listFiles()?.forEach { file ->
-                    if (file.isFile && file.extension.lowercase() == "mp4") {
-                        list.add(file)
+            // Scan app-specific files directory
+            try {
+                val spyCamDirPrivate = File(context.getExternalFilesDir(null), "spy cam")
+                if (spyCamDirPrivate.exists() && spyCamDirPrivate.isDirectory) {
+                    spyCamDirPrivate.listFiles()?.forEach { file ->
+                        if (file.isFile && file.extension.lowercase() == "mp4") {
+                            list.add(file)
+                        }
                     }
                 }
+            } catch (e: Exception) {
+                e.printStackTrace()
             }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
 
-        // Sort by last modified (newest first)
-        recordings = list.sortedByDescending { it.lastModified() }
-        isRefreshing = false
+            // Sort by last modified (newest first)
+            val sorted = list.distinctBy { it.absolutePath }.sortedByDescending { it.lastModified() }
+            withContext(Dispatchers.Main) {
+                recordings = sorted
+                isRefreshing = false
+            }
+        }
     }
 
     LaunchedEffect(Unit) {
@@ -139,6 +148,70 @@ fun RecordingsTab(
             }
         }
 
+        // Active recording banner (if currently silent recording)
+        var isRecordingActive by remember { mutableStateOf(com.example.service.NotchAccessibilityService.isSilentRecording) }
+        LaunchedEffect(Unit) {
+            while (true) {
+                isRecordingActive = com.example.service.NotchAccessibilityService.isSilentRecording
+                kotlinx.coroutines.delay(1000L)
+            }
+        }
+
+        if (isRecordingActive) {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.85f)
+                ),
+                shape = RoundedCornerShape(20.dp),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.5f))
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                        Box(
+                            modifier = Modifier
+                                .size(12.dp)
+                                .clip(CircleShape)
+                                .background(MaterialTheme.colorScheme.error)
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Column {
+                            Text(
+                                text = "Silent Camera Recording",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp,
+                                color = MaterialTheme.colorScheme.onErrorContainer
+                            )
+                            Text(
+                                text = "Tap Stop or use the 'Stop Silent Record' QS tile",
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onErrorContainer.copy(alpha = 0.8f)
+                            )
+                        }
+                    }
+                    Button(
+                        onClick = {
+                            com.example.service.NotchAccessibilityService.stopSilentRecording(context)
+                            isRecordingActive = false
+                            refreshRecordings()
+                        },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.error,
+                            contentColor = MaterialTheme.colorScheme.onError
+                        ),
+                        shape = RoundedCornerShape(12.dp),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                    ) {
+                        Text("Stop", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                    }
+                }
+            }
+        }
+
         if (recordings.isEmpty()) {
             Box(
                 modifier = Modifier
@@ -177,7 +250,7 @@ fun RecordingsTab(
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        text = "Trigger Spy Cam actions via Notch Gestures to capture silent back/front recordings. Recordings will appear here.",
+                        text = "Trigger Spy Cam actions via Notch Gestures to capture silent back/front recordings without notifications. Use the 'Stop Silent Record' Quick Settings tile to stop recording anytime.",
                         textAlign = TextAlign.Center,
                         fontSize = 12.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,

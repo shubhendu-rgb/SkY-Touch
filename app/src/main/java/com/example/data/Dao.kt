@@ -121,3 +121,36 @@ interface TextAssistantDao {
 }
 
 
+
+@Dao
+interface AutoClickDao {
+    @Query("SELECT * FROM autoclick_config WHERE id = 1 LIMIT 1")
+    fun getConfigFlow(): Flow<AutoClickConfigEntity?>
+
+    @Query("SELECT * FROM autoclick_config WHERE id = 1 LIMIT 1")
+    suspend fun getConfigDirect(): AutoClickConfigEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertOrUpdateConfig(config: AutoClickConfigEntity)
+
+    @Query("SELECT * FROM autoclick_points ORDER BY id ASC")
+    fun getPointsFlow(): Flow<List<AutoClickPointEntity>>
+
+    @Query("SELECT * FROM autoclick_points ORDER BY id ASC")
+    suspend fun getPointsDirect(): List<AutoClickPointEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertPoint(point: AutoClickPointEntity)
+
+    @Update
+    suspend fun updatePoint(point: AutoClickPointEntity)
+
+    @Query("DELETE FROM autoclick_points WHERE id = :id")
+    suspend fun deletePoint(id: Int)
+
+    @Query("DELETE FROM autoclick_points WHERE id = (SELECT id FROM autoclick_points ORDER BY id DESC LIMIT 1)")
+    suspend fun deleteLastPoint()
+
+    @Query("DELETE FROM autoclick_points")
+    suspend fun clearAllPoints()
+}

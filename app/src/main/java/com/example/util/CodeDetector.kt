@@ -11,7 +11,7 @@ data class DetectedCodeResult(
 
 object CodeDetector {
 
-    private val recentlyDetectedCache = mutableMapOf<String, Long>()
+    private val recentlyDetectedCache = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
     fun isDuplicate(code: String, pkg: String): Boolean {
         val now = System.currentTimeMillis()

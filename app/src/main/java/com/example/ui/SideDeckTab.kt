@@ -28,6 +28,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
@@ -40,6 +41,8 @@ import com.example.AppEntry
 import com.example.AppInfoCache
 import com.example.data.SideDeckConfigEntity
 import com.example.service.NotchAccessibilityService
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
 
 @Composable
@@ -347,7 +350,9 @@ fun SideDeckTab(
                         Box(
                             modifier = Modifier
                                 .align(if (isRightEdge) Alignment.CenterEnd else Alignment.CenterStart)
-                                .offset(x = (drawerSlideOffset + if (isRightEdge) -miniDockEdgeMargin.value else miniDockEdgeMargin.value).dp)
+                                .graphicsLayer {
+                                    translationX = (drawerSlideOffset + if (isRightEdge) -miniDockEdgeMargin.toPx() else miniDockEdgeMargin.toPx())
+                                }
                                 .width(36.dp)
                                 .clip(RoundedCornerShape(miniDockCornerRadius))
                                 .background(Color(0xE012121D))
@@ -1358,7 +1363,9 @@ fun AppSelectionDialog(
     var isLoading by remember { mutableStateOf(true) }
 
     LaunchedEffect(Unit) {
-        val apps = AppInfoCache.getOrLoadLauncherApps(context)
+        val apps = withContext(Dispatchers.IO) {
+            AppInfoCache.getOrLoadLauncherApps(context)
+        }
         appsList = apps
         isLoading = false
     }

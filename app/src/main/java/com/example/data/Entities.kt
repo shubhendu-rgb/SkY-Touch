@@ -91,7 +91,7 @@ data class TextAssistantConfigEntity(
     @PrimaryKey val id: Int = 1,
     val enabled: Boolean = true,
     val apiKey: String = "", // User provided Gemini API key
-    val modelName: String = "gemini-2.0-flash", // Selected Gemini model
+    val modelName: String = "gemini-3.5-flash", // Selected Gemini model
     val triggerPrefix: String = "?", // e.g. '?', '!', '/', '#'
     val hapticFeedback: Boolean = true,
     val showOverlayPill: Boolean = true,
@@ -110,3 +110,44 @@ data class TextSnippetEntity(
     val isEnabled: Boolean = true
 )
 
+
+@Entity(tableName = "autoclick_config")
+data class AutoClickConfigEntity(
+    @PrimaryKey val id: Int = 1,
+    val isMultiMode: Boolean = true,
+    val clickMode: String = "MULTI", // "SINGLE", "MULTI", "SWIPE"
+    val savedPresetPoints: String = "", // JSON or serialized saved points for preset
+    val intervalMs: Long = 100L,
+    val delayMs: Long = 100L,
+    val slidingTimeMs: Long = 500L,
+    val stopConditionType: String = "INFINITE", // "INFINITE", "TIME", "LOOPS"
+    val stopHours: Int = 0,
+    val stopMinutes: Int = 5,
+    val stopSeconds: Int = 0,
+    val stopLoopCount: Int = 10,
+    val foldMenu: Boolean = false,
+    val showInLandscape: Boolean = true,
+    val minimizeToEdge: Boolean = false,
+    val targetSize: String = "MIDDLE", // "SMALL", "MIDDLE", "BIG"
+    val targetTransparency: Float = 1.0f,
+    val menuSize: String = "MIDDLE", // "SMALL", "MIDDLE", "BIG"
+    val selectedSkin: String = "DEFAULT", // DEFAULT, RED_CROSS, GREEN_TARGET, ORANGE_BRACKET, BLUE_LIGHTBULB, RED_STAR, GREEN_HEX, ORANGE_DIAMOND, ORANGE_SUN, RAINBOW, CYAN_SNOW, YELLOW_MOON
+    val showPointMarkers: Boolean = true,
+    val isMenuVisible: Boolean = false,
+    val panelOpacity: Float = 0.8f,
+    val panelXPx: Int = 100,
+    val panelYPx: Int = 300,
+    val countdownEnabled: Boolean = true
+)
+
+@Entity(tableName = "autoclick_points")
+data class AutoClickPointEntity(
+    @PrimaryKey(autoGenerate = true) val id: Int = 0,
+    val xPx: Int,
+    val yPx: Int,
+    val endXPx: Int = 0,
+    val endYPx: Int = 0,
+    val gestureType: String = "SINGLE_TAP", // SINGLE_TAP, DOUBLE_TAP, LONG_PRESS, SWIPE
+    val delayAfterMs: Long = 0L,
+    val enabled: Boolean = true
+)

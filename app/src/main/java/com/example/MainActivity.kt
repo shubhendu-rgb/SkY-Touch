@@ -22,10 +22,10 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
-import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.*
 import androidx.compose.animation.core.*
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
+import kotlin.math.roundToInt
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -56,7 +56,9 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
@@ -64,16 +66,21 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import com.example.ui.CodeDetectionTab
 import com.example.ui.TextAssistantTab
+import com.example.ui.AutoClickTab
+import com.example.ui.AutoClickSubScreen
 import com.example.ui.DeveloperTab
 import com.example.ui.RecordingsTab
 import com.example.ui.ExcludedAppsTab
 import com.example.ui.BackupRestoreTab
+import com.example.util.AppShortcutHelper
+import com.example.util.AppShortcutItem
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -104,9 +111,17 @@ class MainActivity : ComponentActivity() {
         db = AppDatabase.getDatabase(this)
         repository = NotchRepository(db)
         OtpNotificationHelper.createNotificationChannel(this)
+        com.example.ui.island.DynamicNotchManager.initialize(this)
 
         enableEdgeToEdge(statusBarStyle = androidx.activity.SystemBarStyle.auto(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT), navigationBarStyle = androidx.activity.SystemBarStyle.auto(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT))
         val prefs = getSharedPreferences("theme_prefs", Context.MODE_PRIVATE)
+
+        // Warm the app/shortcut caches in the background so pickers and popups open instantly
+        lifecycleScope.launch(Dispatchers.IO) {
+            delay(1200L) // let the first frame draw first
+            try { AppInfoCache.getOrLoadLauncherApps(applicationContext) } catch (_: Throwable) {}
+            try { AppShortcutHelper.getOrLoadAllShortcuts(applicationContext) } catch (_: Throwable) {}
+        }
         setContent {
             val systemDark = androidx.compose.foundation.isSystemInDarkTheme()
             var isDarkMode by remember {
@@ -167,6 +182,15 @@ class MainActivity : ComponentActivity() {
 }
 
 // Utility to check if service is enabled in settings
+object SharedHttpClient {
+    val client: okhttp3.OkHttpClient by lazy {
+        okhttp3.OkHttpClient.Builder()
+            .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+    }
+}
+
 fun isAccessibilityServiceEnabled(context: Context, serviceClass: Class<*>): Boolean {
     val expectedComponentName = ComponentName(context, serviceClass)
     val enabledServicesSetting = Settings.Secure.getString(
@@ -186,7 +210,7 @@ fun isAccessibilityServiceEnabled(context: Context, serviceClass: Class<*>): Boo
 }
 
 enum class ScreenType {
-    DASHBOARD, GESTURES, CALIBRATION, SIDE_DECK, CODE_DETECTION, TEXT_ASSISTANT, ANALYTICS, DEVELOPER, RECORDINGS, EXCLUDED_APPS, INSTRUCTIONS, BACKUP_RESTORE, WALLPAPER
+    DASHBOARD, GESTURES, CALIBRATION, SIDE_DECK, CODE_DETECTION, TEXT_ASSISTANT, AUTOCLICK, ANALYTICS, DEVELOPER, RECORDINGS, EXCLUDED_APPS, INSTRUCTIONS, BACKUP_RESTORE, WALLPAPER, LIVE_WALLPAPER, DYNAMIC_NOTCH
 }
 
 
@@ -208,6 +232,7 @@ fun MainContentScreen(
 
     var isServiceRunning by remember { mutableStateOf(false) }
     var isPermissionEnabled by remember { mutableStateOf(false) }
+    var updateInfo by remember { mutableStateOf<com.example.util.UpdateInfo?>(null) }
 
     val cameraPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -221,10 +246,32 @@ fun MainContentScreen(
 
     // Periodically check service status
     LaunchedEffect(Unit) {
+        launch {
+            val info = com.example.util.UpdateChecker.checkForUpdates(context)
+            if (info != null && info.isUpdateAvailable) {
+                updateInfo = info
+                com.example.util.UpdateChecker.showUpdateNotification(context, info)
+            }
+        }
+        
+        val prefs = context.getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
+        val justRestored = prefs.getBoolean("just_restored_backup", false)
+        if (justRestored) {
+            prefs.edit().putBoolean("just_restored_backup", false).apply()
+            val initiallyEnabled = isAccessibilityServiceEnabled(context, NotchAccessibilityService::class.java)
+            if (!initiallyEnabled) {
+                onOpenSettings()
+            }
+        }
+        
         while (true) {
-            isServiceRunning = NotchAccessibilityService.isRunning
-            isPermissionEnabled = isAccessibilityServiceEnabled(context, NotchAccessibilityService::class.java)
-            delay(1500)
+            val running = NotchAccessibilityService.isRunning
+            val perm = withContext(Dispatchers.IO) {
+                isAccessibilityServiceEnabled(context, NotchAccessibilityService::class.java)
+            }
+            if (isServiceRunning != running) isServiceRunning = running
+            if (isPermissionEnabled != perm) isPermissionEnabled = perm
+            delay(2000)
         }
     }
 
@@ -246,9 +293,16 @@ fun MainContentScreen(
         }
     }
     var currentScreen by remember { mutableStateOf(initialScreen) }
+    var autoClickSubScreen by remember { mutableStateOf<AutoClickSubScreen?>(null) }
     var editingActionGesture by remember { mutableStateOf<String?>(null) }
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val scope = rememberCoroutineScope()
+
+    LaunchedEffect(currentScreen) {
+        if (currentScreen != ScreenType.AUTOCLICK) {
+            autoClickSubScreen = null
+        }
+    }
 
     var githubName by remember { mutableStateOf("Details & About") }
     var githubAvatar by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
@@ -257,7 +311,7 @@ fun MainContentScreen(
         kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
             try {
                 val request = okhttp3.Request.Builder().url("https://api.github.com/users/shubhendu-rgb").build()
-                val response = okhttp3.OkHttpClient().newCall(request).execute()
+                val response = SharedHttpClient.client.newCall(request).execute()
                 if (response.isSuccessful) {
                     val json = org.json.JSONObject(response.body?.string() ?: "")
                     val name = json.optString("name", "Shubhendu Kumar Sahoo")
@@ -269,7 +323,7 @@ fun MainContentScreen(
 
                     if (avatarUrl.isNotEmpty()) {
                         val imgRequest = okhttp3.Request.Builder().url(avatarUrl).build()
-                        val imgResponse = okhttp3.OkHttpClient().newCall(imgRequest).execute()
+                        val imgResponse = SharedHttpClient.client.newCall(imgRequest).execute()
                         if (imgResponse.isSuccessful) {
                             val bytes = imgResponse.body?.bytes()
                             if (bytes != null) {
@@ -289,11 +343,15 @@ fun MainContentScreen(
     }
 
     // Handle system back button for 1-step back navigation
-    BackHandler(enabled = drawerState.isOpen || editingActionGesture != null || currentScreen != ScreenType.DASHBOARD) {
+    BackHandler(enabled = drawerState.isOpen || editingActionGesture != null || (currentScreen == ScreenType.AUTOCLICK && autoClickSubScreen != null) || currentScreen != ScreenType.DASHBOARD) {
         if (drawerState.isOpen) {
             scope.launch { drawerState.close() }
         } else if (editingActionGesture != null) {
             editingActionGesture = null
+        } else if (currentScreen == ScreenType.AUTOCLICK && autoClickSubScreen != null) {
+            autoClickSubScreen = null
+        } else if (currentScreen == ScreenType.LIVE_WALLPAPER) {
+            currentScreen = ScreenType.WALLPAPER
         } else if (currentScreen != ScreenType.DASHBOARD) {
             currentScreen = ScreenType.DASHBOARD
         }
@@ -301,7 +359,7 @@ fun MainContentScreen(
 
     ModalNavigationDrawer(
         drawerState = drawerState,
-        gesturesEnabled = drawerState.isOpen,
+        gesturesEnabled = true,
         drawerContent = {
             ModalDrawerSheet(
                 drawerContainerColor = MaterialTheme.colorScheme.surface,
@@ -310,7 +368,24 @@ fun MainContentScreen(
                 Column(
                     modifier = Modifier.fillMaxHeight().padding(24.dp)
                 ) {
-                    Text("SkY Touch", fontSize = 24.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text("SkY Touch", fontSize = 24.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+                        Surface(
+                            color = MaterialTheme.colorScheme.primaryContainer,
+                            shape = RoundedCornerShape(6.dp)
+                        ) {
+                            Text(
+                                text = "v8.1",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
+                    }
                     Spacer(modifier = Modifier.height(32.dp))
                     
                     Text("Theme", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.primary)
@@ -428,117 +503,167 @@ fun MainContentScreen(
             )
         }
 
+        val showMainTopBar = !(currentScreen == ScreenType.AUTOCLICK && autoClickSubScreen != null) &&
+            currentScreen != ScreenType.DYNAMIC_NOTCH &&
+            currentScreen != ScreenType.WALLPAPER &&
+            currentScreen != ScreenType.LIVE_WALLPAPER
+
         Scaffold(
             topBar = {
-                CenterAlignedTopAppBar(
-                    title = {
-                        Text(
-                            text = when (currentScreen) {
-                                ScreenType.DASHBOARD -> "Dashboard"
-                                ScreenType.GESTURES -> "Gestures"
-                                ScreenType.CALIBRATION -> "Calibration"
-                                ScreenType.SIDE_DECK -> "Side Deck"
-                                ScreenType.CODE_DETECTION -> "Code Detector"
-                                ScreenType.TEXT_ASSISTANT -> "Text Assistant & AI"
-                                ScreenType.ANALYTICS -> "Analytics"
-                                ScreenType.DEVELOPER -> "About Developer"
-                                ScreenType.RECORDINGS -> "Video Recordings"
-                                ScreenType.EXCLUDED_APPS -> "Excluded Apps"
-                                ScreenType.INSTRUCTIONS -> "Instructions"
-                                ScreenType.BACKUP_RESTORE -> "Backup & Restore"
-                                ScreenType.WALLPAPER -> "Auto Wallpaper"
-                            },
+                if (showMainTopBar) {
+                    CenterAlignedTopAppBar(
+                        title = {
+                            Text(
+                                text = when (currentScreen) {
+                                    ScreenType.DASHBOARD -> "Dashboard"
+                                    ScreenType.GESTURES -> "Gestures"
+                                    ScreenType.CALIBRATION -> "Calibration"
+                                    ScreenType.SIDE_DECK -> "Side Deck"
+                                    ScreenType.CODE_DETECTION -> "Code Detector"
+                                    ScreenType.TEXT_ASSISTANT -> "Text Assistant & AI"
+                                    ScreenType.AUTOCLICK -> "AutoClick Studio"
+                                    ScreenType.ANALYTICS -> "Analytics"
+                                    ScreenType.DEVELOPER -> "About Developer"
+                                    ScreenType.RECORDINGS -> "Video Recordings"
+                                    ScreenType.EXCLUDED_APPS -> "Excluded Apps"
+                                    ScreenType.INSTRUCTIONS -> "Instructions"
+                                    ScreenType.BACKUP_RESTORE -> "Backup & Restore"
+                                    ScreenType.WALLPAPER -> "Wallpaper Changer"
+                                    ScreenType.LIVE_WALLPAPER -> "Live Wallpaper Studio"
+                                    ScreenType.DYNAMIC_NOTCH -> "Dynamic Notch"
+                                },
 
-                            fontWeight = FontWeight.Bold,
-                            color = onSurfaceColor
+                                fontWeight = FontWeight.Bold,
+                                color = onSurfaceColor
+                            )
+                        },
+                        navigationIcon = {
+                            if (currentScreen == ScreenType.DASHBOARD) {
+                                IconButton(onClick = { scope.launch { drawerState.open() } }) {
+                                    Icon(Icons.Default.Menu, contentDescription = "Menu", tint = onSurfaceColor)
+                                }
+                            } else {
+                                IconButton(onClick = {
+                                    if (currentScreen == ScreenType.LIVE_WALLPAPER) {
+                                        currentScreen = ScreenType.WALLPAPER
+                                    } else {
+                                        currentScreen = ScreenType.DASHBOARD
+                                    }
+                                }) {
+                                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = onSurfaceColor)
+                                }
+                            }
+                        },
+                        colors = TopAppBarDefaults.centerAlignedTopAppBarColors(
+                            containerColor = Color.Transparent
                         )
-                    },
-                    navigationIcon = {
-                        if (currentScreen == ScreenType.DASHBOARD) {
-                            IconButton(onClick = { scope.launch { drawerState.open() } }) {
-                                Icon(Icons.Default.Menu, contentDescription = "Menu", tint = onSurfaceColor)
-                            }
-                        } else {
-                            IconButton(onClick = { currentScreen = ScreenType.DASHBOARD }) {
-                                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = onSurfaceColor)
-                            }
-                        }
-                    },
-                    colors = TopAppBarDefaults.centerAlignedTopAppBarColors(
-                        containerColor = Color.Transparent
                     )
-                )
+                }
             },
             containerColor = Color.Transparent,
             modifier = modifier
                 .fillMaxSize()
                 .background(backgroundBrush)
         ) { paddingValues ->
+            val effectivePadding = if (!showMainTopBar) PaddingValues(0.dp) else paddingValues
             Column(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(paddingValues)
+                    .padding(effectivePadding)
             ) {
                 Box(
                     modifier = Modifier
                         .weight(1f)
                         .fillMaxWidth()
-                        .padding(horizontal = 16.dp)
+                        .padding(
+                            horizontal = if (currentScreen == ScreenType.AUTOCLICK ||
+                                currentScreen == ScreenType.TEXT_ASSISTANT ||
+                                currentScreen == ScreenType.DYNAMIC_NOTCH ||
+                                currentScreen == ScreenType.WALLPAPER ||
+                                currentScreen == ScreenType.LIVE_WALLPAPER
+                            ) 0.dp else 16.dp
+                        )
                 ) {
-                    when (currentScreen) {
-                        ScreenType.DASHBOARD -> DashboardScreen(
-                            isServiceRunning = isServiceRunning,
-                            isPermissionEnabled = isPermissionEnabled,
-                            onOpenSettings = onOpenSettings,
-                            onNavigate = { currentScreen = it }
-                        )
-                        ScreenType.GESTURES -> GesturesTab(
-                            actions = uiState.actions,
-                            onConfigureGesture = { editingActionGesture = it }
-                        )
-                        ScreenType.CALIBRATION -> CalibrationTab(
-                            config = uiState.config,
-                            onConfigChange = { viewModel.updateConfig(it) },
-                            onConfigChangeDebounced = { viewModel.updateConfigDebounced(it) }
-                        )
-                        ScreenType.SIDE_DECK -> SideDeckTab(
-                            sideDeckConfig = uiState.sideDeckConfig,
-                            isServiceActive = isServiceActive,
-                            onConfigChange = { viewModel.updateSideDeckConfig(it) },
-                            onConfigChangeDebounced = { viewModel.updateSideDeckConfigDebounced(it) },
-                            onOpenSettings = onOpenSettings
-                        )
-                        ScreenType.CODE_DETECTION -> CodeDetectionTab(
-                            config = uiState.codeConfig,
-                            detectedCodes = uiState.detectedCodes,
-                            onConfigChange = { viewModel.updateCodeConfig(it) },
-                            onConfigChangeDebounced = { viewModel.updateCodeConfigDebounced(it) },
-                            onClearHistory = { viewModel.clearDetectedCodes() },
-                            onDeleteHistoryItem = { viewModel.deleteDetectedCode(it) },
-                            onAddDetectedCode = { viewModel.addDetectedCode(it) }
-                        )
-                        ScreenType.TEXT_ASSISTANT -> TextAssistantTab(
-                            viewModel = viewModel,
-                            onOpenSettings = onOpenSettings
-                        )
-                        ScreenType.ANALYTICS -> AnalyticsTab(
-
-                            stats = uiState.stats,
-                            onResetStats = { viewModel.resetStats() },
-                            onSimulateGesture = { viewModel.triggerTestGesture(it) },
-                            testMessage = testMessage
-                        )
-                        ScreenType.DEVELOPER -> DeveloperTab()
-                        ScreenType.RECORDINGS -> RecordingsTab()
-                        ScreenType.EXCLUDED_APPS -> ExcludedAppsTab(
-                            notchConfig = uiState.config,
-                            onConfigChange = { viewModel.updateConfig(it) }
-                        )
-                        ScreenType.INSTRUCTIONS -> com.example.ui.InstructionsTab()
-                        ScreenType.BACKUP_RESTORE -> BackupRestoreTab(
-                            repository = repository
-                        )
-                        ScreenType.WALLPAPER -> com.example.ui.WallpaperTab()
+                    AnimatedContent(
+                        targetState = currentScreen,
+                        transitionSpec = {
+                            fadeIn(animationSpec = tween(120, easing = LinearOutSlowInEasing))
+                                .togetherWith(fadeOut(animationSpec = tween(80)))
+                        },
+                        label = "screen_transition",
+                        modifier = Modifier.fillMaxSize()
+                    ) { targetScreen ->
+                        when (targetScreen) {
+                            ScreenType.DASHBOARD -> DashboardScreen(
+                                isServiceRunning = isServiceRunning,
+                                isPermissionEnabled = isPermissionEnabled,
+                                onOpenSettings = onOpenSettings,
+                                onNavigate = { currentScreen = it }
+                            )
+                            ScreenType.GESTURES -> GesturesTab(
+                                actions = uiState.actions,
+                                onConfigureGesture = { editingActionGesture = it }
+                            )
+                            ScreenType.CALIBRATION -> CalibrationTab(
+                                config = uiState.config,
+                                onConfigChange = { viewModel.updateConfig(it) },
+                                onConfigChangeDebounced = { viewModel.updateConfigDebounced(it) }
+                            )
+                            ScreenType.SIDE_DECK -> SideDeckTab(
+                                sideDeckConfig = uiState.sideDeckConfig,
+                                isServiceActive = isServiceActive,
+                                onConfigChange = { viewModel.updateSideDeckConfig(it) },
+                                onConfigChangeDebounced = { viewModel.updateSideDeckConfigDebounced(it) },
+                                onOpenSettings = onOpenSettings
+                            )
+                            ScreenType.CODE_DETECTION -> CodeDetectionTab(
+                                config = uiState.codeConfig,
+                                detectedCodes = uiState.detectedCodes,
+                                onConfigChange = { viewModel.updateCodeConfig(it) },
+                                onConfigChangeDebounced = { viewModel.updateCodeConfigDebounced(it) },
+                                onClearHistory = { viewModel.clearDetectedCodes() },
+                                onDeleteHistoryItem = { viewModel.deleteDetectedCode(it) },
+                                onAddDetectedCode = { viewModel.addDetectedCode(it) }
+                            )
+                            ScreenType.TEXT_ASSISTANT -> TextAssistantTab(
+                                viewModel = viewModel,
+                                onOpenSettings = onOpenSettings
+                            )
+                            ScreenType.AUTOCLICK -> AutoClickTab(
+                                viewModel = viewModel,
+                                currentSubScreen = autoClickSubScreen,
+                                onSubScreenChange = { autoClickSubScreen = it }
+                            )
+                            ScreenType.ANALYTICS -> AnalyticsTab(
+                                stats = uiState.stats,
+                                onResetStats = { viewModel.resetStats() },
+                                onSimulateGesture = { viewModel.triggerTestGesture(it) },
+                                testMessage = testMessage
+                            )
+                            ScreenType.DEVELOPER -> DeveloperTab()
+                            ScreenType.RECORDINGS -> RecordingsTab()
+                            ScreenType.EXCLUDED_APPS -> ExcludedAppsTab(
+                                notchConfig = uiState.config,
+                                onConfigChange = { viewModel.updateConfig(it) }
+                            )
+                            ScreenType.INSTRUCTIONS -> com.example.ui.InstructionsTab()
+                            ScreenType.BACKUP_RESTORE -> BackupRestoreTab(
+                                repository = repository
+                            )
+                            ScreenType.WALLPAPER -> com.example.ui.WallpaperTab(
+                                onBack = { currentScreen = ScreenType.DASHBOARD }
+                            )
+                            ScreenType.LIVE_WALLPAPER -> com.example.ui.LiveWallpaperTab(
+                                onBack = { currentScreen = ScreenType.DASHBOARD }
+                            )
+                            ScreenType.DYNAMIC_NOTCH -> com.example.ui.island.DynamicNotchScreen(
+                                onBack = { currentScreen = ScreenType.DASHBOARD },
+                                config = uiState.config,
+                                onConfigChange = { viewModel.updateConfig(it) },
+                                onConfigChangeDebounced = { viewModel.updateConfigDebounced(it) },
+                                initialTab = com.example.ui.island.DynamicNotchTab.SKINS
+                            )
+                        }
                     }
                 }
             }
@@ -570,6 +695,28 @@ fun MainContentScreen(
                     )
                 )
                 editingActionGesture = null
+            }
+        )
+    }
+
+    if (updateInfo != null) {
+        AlertDialog(
+            onDismissRequest = { updateInfo = null },
+            title = { Text("Update Available", fontWeight = androidx.compose.ui.text.font.FontWeight.Bold) },
+            text = { Text("A new version (${updateInfo!!.version}) of the app is available. Would you like to download it from GitHub?") },
+            confirmButton = {
+                Button(onClick = {
+                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(updateInfo!!.releaseUrl))
+                    context.startActivity(intent)
+                    updateInfo = null
+                }) {
+                    Text("Update Now")
+                }
+            },
+            dismissButton = {
+                androidx.compose.material3.TextButton(onClick = { updateInfo = null }) {
+                    Text("Later")
+                }
             }
         )
     }
@@ -751,12 +898,15 @@ fun DashboardScreen(
 
     LaunchedEffect(context) {
         while (true) {
-            isIgnoringBattery = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                powerManager?.isIgnoringBatteryOptimizations(context.packageName) == true
-            } else {
-                true
+            val ignoring = withContext(Dispatchers.IO) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    powerManager?.isIgnoringBatteryOptimizations(context.packageName) == true
+                } else {
+                    true
+                }
             }
-            delay(1500)
+            if (isIgnoringBattery != ignoring) isIgnoringBattery = ignoring
+            delay(3000)
         }
     }
 
@@ -850,6 +1000,14 @@ fun DashboardScreen(
 
             item {
                 DashboardCard(
+                    title = "Dynamic Notch",
+                    description = "Custom skins, physics pop animations, behavior settings & capsule events.",
+                    icon = Icons.Filled.Layers,
+                    onClick = { onNavigate(ScreenType.DYNAMIC_NOTCH) }
+                )
+            }
+            item {
+                DashboardCard(
                     title = "Notch Gestures",
                     description = "Configure custom swipe actions around your front camera.",
                     icon = Icons.Filled.TouchApp,
@@ -890,8 +1048,16 @@ fun DashboardScreen(
             }
             item {
                 DashboardCard(
-                    title = "Automatic Wallpaper",
-                    description = "Change wallpaper automatically from a selected folder.",
+                    title = "AutoClick Studio",
+                    description = "Automated screen taps, gestures, reticle skins, and floating pill controls.",
+                    icon = Icons.Filled.TouchApp,
+                    onClick = { onNavigate(ScreenType.AUTOCLICK) }
+                )
+            }
+            item {
+                DashboardCard(
+                    title = "Wallpaper Changer",
+                    description = "Change wallpaper automatically from images or folder with blur, presets & live preview.",
                     icon = Icons.Filled.Wallpaper,
                     onClick = { onNavigate(ScreenType.WALLPAPER) }
                 )
@@ -908,6 +1074,12 @@ fun DashboardCard(
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val primaryColor = MaterialTheme.colorScheme.primary
+    val tertiaryColor = MaterialTheme.colorScheme.tertiary
+    val iconBackgroundBrush = remember(primaryColor, tertiaryColor) {
+        Brush.linearGradient(listOf(primaryColor, tertiaryColor))
+    }
+
     Card(
         onClick = onClick,
         modifier = modifier.fillMaxWidth(),
@@ -926,14 +1098,7 @@ fun DashboardCard(
                 modifier = Modifier
                     .size(48.dp)
                     .clip(RoundedCornerShape(14.dp))
-                    .background(
-                        Brush.linearGradient(
-                            listOf(
-                                MaterialTheme.colorScheme.primary,
-                                MaterialTheme.colorScheme.tertiary
-                            )
-                        )
-                    ),
+                    .background(iconBackgroundBrush),
                 contentAlignment = Alignment.Center
             ) {
                 Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.onPrimary, modifier = Modifier.size(24.dp))
@@ -989,69 +1154,57 @@ fun GesturesTab(
         "SWIPE_RIGHT_AND_HOLD" to "Swipe Right & Hold"
     )
 
-    val gestureOrder = listOf(
-        "SINGLE_TAP",
-        "DOUBLE_TAP",
-        "TRIPLE_TAP",
-        "LONG_PRESS",
-        "SWIPE_LEFT",
-        "SWIPE_RIGHT",
-        "SWIPE_LEFT_AND_HOLD",
-        "SWIPE_RIGHT_AND_HOLD"
-    )
-
-    val visibleActions = actions
-        .filter { it.gestureName != "SWIPE_DOWN" }
-        .sortedBy { val idx = gestureOrder.indexOf(it.gestureName); if (idx != -1) idx else 99 }
+    val visibleActions = remember(actions) {
+        val gestureOrder = listOf(
+            "SINGLE_TAP",
+            "DOUBLE_TAP",
+            "TRIPLE_TAP",
+            "LONG_PRESS",
+            "SWIPE_LEFT",
+            "SWIPE_RIGHT",
+            "SWIPE_LEFT_AND_HOLD",
+            "SWIPE_RIGHT_AND_HOLD"
+        )
+        actions
+            .filter { it.gestureName != "SWIPE_DOWN" }
+            .sortedBy { val idx = gestureOrder.indexOf(it.gestureName); if (idx != -1) idx else 99 }
+    }
 
     val context = LocalContext.current
-    val hasBrightnessAction = visibleActions.any { it.actionType in listOf("BRIGHTNESS_UP", "BRIGHTNESS_DOWN", "CUSTOM_BRIGHTNESS") }
+    val hasBrightnessAction = remember(visibleActions) {
+        visibleActions.any { it.actionType in listOf("BRIGHTNESS_UP", "BRIGHTNESS_DOWN", "CUSTOM_BRIGHTNESS") }
+    }
     val isWriteSettingsOk = remember(context) { isWriteSettingsGranted(context) }
 
     LazyColumn(
-        verticalArrangement = Arrangement.spacedBy(10.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+        contentPadding = PaddingValues(top = 4.dp, bottom = 16.dp),
         modifier = Modifier.fillMaxSize().testTag("gestures_list")
     ) {
-        item {
-            Text(
-                text = "Gesture Shortcut Actions",
-                color = MaterialTheme.colorScheme.onSurface,
-                fontSize = 18.sp,
-                fontWeight = FontWeight.Bold,
-                modifier = Modifier.padding(vertical = 4.dp)
-            )
-            Text(
-                text = "Configure actions to execute when you touch or swipe around the camera.",
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                fontSize = 12.sp,
-                modifier = Modifier.padding(bottom = 12.dp)
-            )
-        }
-
         if (hasBrightnessAction && !isWriteSettingsOk) {
             item {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(20.dp),
+                    shape = RoundedCornerShape(14.dp),
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.5f)),
                     border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
                 ) {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(14.dp),
+                            .padding(12.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
                                 text = "Brightness Permission Needed",
-                                fontSize = 14.sp,
+                                fontSize = 13.sp,
                                 fontWeight = FontWeight.Bold,
                                 color = MaterialTheme.colorScheme.onErrorContainer
                             )
                             Text(
-                                text = "Allow 'Modify system settings' so gesture actions can change screen brightness.",
+                                text = "Allow 'Modify system settings' for brightness gestures.",
                                 fontSize = 11.sp,
                                 color = MaterialTheme.colorScheme.onErrorContainer.copy(alpha = 0.85f),
                                 modifier = Modifier.padding(top = 2.dp)
@@ -1070,7 +1223,7 @@ fun GesturesTab(
                                     } catch (_: Exception) {}
                                 }
                             },
-                            shape = RoundedCornerShape(24.dp),
+                            shape = RoundedCornerShape(12.dp),
                             contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
                         ) {
                             Text("Grant", fontSize = 12.sp)
@@ -1084,79 +1237,72 @@ fun GesturesTab(
             val gestureName = gestureAction.gestureName
             val icon = gestureIcons[gestureName] ?: Icons.Default.Adjust
             val prettyName = gestureLabels[gestureName] ?: gestureName
+            val isConfigured = gestureAction.actionType != "NONE"
+            val actionDesc = getActionDescription(gestureAction)
 
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clickable { onConfigureGesture(gestureName) }
                     .testTag("gesture_item_$gestureName"),
-                shape = RoundedCornerShape(24.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.88f)),
-                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)),
-                elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+                shape = RoundedCornerShape(14.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = if (isConfigured) MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f) else MaterialTheme.colorScheme.surface.copy(alpha = 0.6f)
+                ),
+                border = BorderStroke(
+                    1.dp,
+                    if (isConfigured) MaterialTheme.colorScheme.primary.copy(alpha = 0.25f) else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f)
+                ),
+                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
             ) {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(16.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(
-                            modifier = Modifier
-                                .size(40.dp)
-                                .clip(RoundedCornerShape(24.dp))
-                                .background(MaterialTheme.colorScheme.primaryContainer),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(
-                                imageVector = icon,
-                                contentDescription = prettyName,
-                                tint = MaterialTheme.colorScheme.primary
-                            )
-                        }
-                        Spacer(modifier = Modifier.width(16.dp))
-                        Column {
-                            Text(
-                                text = prettyName,
-                                color = MaterialTheme.colorScheme.onSurface,
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 15.sp
-                            )
-                            Text(
-                                text = getActionDescription(gestureAction),
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                fontSize = 13.sp
-                            )
-                        }
-                    }
-
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            text = if (gestureAction.actionType == "NONE") "Disabled" else "Edit",
-                            color = if (gestureAction.actionType == "NONE") MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.primary,
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Bold,
-                            modifier = Modifier
-                                .clip(CircleShape)
-                                .background(if (gestureAction.actionType == "NONE") Color.Transparent else MaterialTheme.colorScheme.primaryContainer)
-                                .padding(horizontal = 10.dp, vertical = 6.dp)
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
+                    Box(
+                        modifier = Modifier
+                            .size(34.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(
+                                if (isConfigured) MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
+                                else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+                            ),
+                        contentAlignment = Alignment.Center
+                    ) {
                         Icon(
-                            imageVector = Icons.Default.ChevronRight,
-                            contentDescription = "Edit Action",
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.size(16.dp)
+                            imageVector = icon,
+                            contentDescription = prettyName,
+                            tint = if (isConfigured) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(18.dp)
                         )
                     }
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = prettyName,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 14.sp
+                        )
+                        Text(
+                            text = actionDesc,
+                            color = if (isConfigured) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                            fontSize = 12.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Icon(
+                        imageVector = Icons.Default.ChevronRight,
+                        contentDescription = "Edit Action",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f),
+                        modifier = Modifier.size(16.dp)
+                    )
                 }
             }
-        }
-
-        item {
-            Spacer(modifier = Modifier.height(24.dp))
         }
     }
 }
@@ -1183,12 +1329,34 @@ fun getActionDescription(entity: GestureActionEntity): String {
         "CUSTOM_BRIGHTNESS" -> "Set Brightness to ${entity.extraValue ?: "50"}%"
         "LAUNCH_APP" -> if (entity.label.startsWith("Open ")) entity.label else "Open App: ${entity.label}"
         "SHORTCUT" -> if (entity.label.startsWith("Shortcut: ")) entity.label else "Shortcut: ${entity.label}"
+        "WALLPAPER_NEXT" -> "Next Wallpaper"
+        "WALLPAPER_PREVIOUS" -> "Previous Wallpaper"
+        "WALLPAPER_RANDOM" -> "Random Wallpaper"
+        "WALLPAPER_HOME_NEXT" -> "Next Home Wallpaper"
+        "WALLPAPER_LOCK_NEXT" -> "Next Lock Screen Wallpaper"
+        "WALLPAPER_IMAGES_NEXT" -> "Next Wallpaper (Selected Images)"
+        "WALLPAPER_FOLDER_NEXT" -> "Next Wallpaper (Folder)"
         else -> "Disabled (No Action)"
     }
 }
 
 @Composable
 fun CalibrationTab(
+    config: NotchConfigEntity,
+    onConfigChange: (NotchConfigEntity) -> Unit,
+    onConfigChangeDebounced: ((NotchConfigEntity) -> Unit)? = null
+) {
+    com.example.ui.island.DynamicNotchScreen(
+        onBack = {},
+        config = config,
+        onConfigChange = onConfigChange,
+        onConfigChangeDebounced = onConfigChangeDebounced,
+        initialTab = com.example.ui.island.DynamicNotchTab.POSITION
+    )
+}
+
+@Composable
+private fun LegacyCalibrationTabUnused(
     config: NotchConfigEntity,
     onConfigChange: (NotchConfigEntity) -> Unit,
     onConfigChangeDebounced: ((NotchConfigEntity) -> Unit)? = null
@@ -1578,7 +1746,7 @@ fun NotchPreviewMockup(
                     Text("09:41", color = Color.White.copy(alpha = 0.7f), fontSize = 11.sp, fontWeight = FontWeight.Bold)
                     Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                         Icon(imageVector = Icons.Default.Wifi, contentDescription = "wifi", tint = Color.White.copy(alpha = 0.7f), modifier = Modifier.size(11.dp))
-                        Icon(imageVector = Icons.Default.BatteryFull, contentDescription = "battery", tint = Color.White.copy(alpha = 0.7f), modifier = Modifier.size(11.dp))
+                        Icon(imageVector = Icons.Default.BatteryChargingFull, contentDescription = "battery", tint = Color.White.copy(alpha = 0.7f), modifier = Modifier.size(11.dp))
                     }
                 }
 
@@ -1591,7 +1759,7 @@ fun NotchPreviewMockup(
 
                 Box(
                     modifier = Modifier
-                        .offset(x = mockupX, y = mockupY)
+                        .offset { IntOffset(mockupX.roundToPx(), mockupY.roundToPx()) }
                         .align(Alignment.TopCenter)
                         .size(width = mockupWidth, height = mockupHeight)
                         .clip(
@@ -1705,10 +1873,12 @@ fun AnalyticsTab(
         "SWIPE_RIGHT_AND_HOLD"
     )
 
-    val visibleStats = stats
-        .filter { it.gestureName != "SWIPE_DOWN" }
-        .sortedBy { val idx = gestureOrder.indexOf(it.gestureName); if (idx != -1) idx else 99 }
-    val totalTriggers = visibleStats.sumOf { it.count }
+    val visibleStats = remember(stats) {
+        stats
+            .filter { it.gestureName != "SWIPE_DOWN" }
+            .sortedBy { val idx = gestureOrder.indexOf(it.gestureName); if (idx != -1) idx else 99 }
+    }
+    val totalTriggers = remember(visibleStats) { visibleStats.sumOf { it.count } }
 
     val isDark = isSystemInDarkTheme()
     val bannerBg = if (isDark) Color(0x3322C55E) else Color(0xFFDCFCE7)
@@ -1819,32 +1989,34 @@ fun AnalyticsTab(
                         )
                     } else {
                         visibleStats.forEach { stat ->
-                            val prettyName = gesturePrettyNames[stat.gestureName] ?: stat.gestureName
-                            val percentage = if (totalTriggers > 0) stat.count.toFloat() / totalTriggers else 0f
+                            key(stat.gestureName) {
+                                val prettyName = gesturePrettyNames[stat.gestureName] ?: stat.gestureName
+                                val percentage = if (totalTriggers > 0) stat.count.toFloat() / totalTriggers else 0f
 
-                            Column(modifier = Modifier.padding(vertical = 6.dp)) {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween
-                                ) {
-                                    Text(prettyName, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp)
-                                    Text(
-                                        text = "${stat.count} runs",
-                                        color = MaterialTheme.colorScheme.onSurface,
-                                        fontSize = 13.sp,
-                                        fontWeight = FontWeight.Bold
+                                Column(modifier = Modifier.padding(vertical = 6.dp)) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Text(prettyName, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp)
+                                        Text(
+                                            text = "${stat.count} runs",
+                                            color = MaterialTheme.colorScheme.onSurface,
+                                            fontSize = 13.sp,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    LinearProgressIndicator(
+                                        progress = { percentage },
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .height(6.dp)
+                                            .clip(RoundedCornerShape(3.dp)),
+                                        color = MaterialTheme.colorScheme.primary,
+                                        trackColor = MaterialTheme.colorScheme.surfaceVariant
                                     )
                                 }
-                                Spacer(modifier = Modifier.height(4.dp))
-                                LinearProgressIndicator(
-                                    progress = { percentage },
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .height(6.dp)
-                                        .clip(RoundedCornerShape(3.dp)),
-                                    color = MaterialTheme.colorScheme.primary,
-                                    trackColor = MaterialTheme.colorScheme.surfaceVariant
-                                )
                             }
                         }
                     }
@@ -1892,10 +2064,27 @@ fun AnalyticsTab(
                     var dragStartTime by remember { mutableLongStateOf(0L) }
                     var isSwipeHoldDetected by remember { mutableStateOf(false) }
                     var currentDragDeltaX by remember { mutableFloatStateOf(0f) }
+                    var isDraggingTarget by remember { mutableStateOf(false) }
+
+                    val animatedDragOffset by animateFloatAsState(
+                        targetValue = if (isDraggingTarget) currentDragDeltaX.coerceIn(-50f, 50f) else 0f,
+                        animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessMedium),
+                        label = "simulated_drag"
+                    )
+                    val animatedTargetScale by animateFloatAsState(
+                        targetValue = if (isDraggingTarget) 1.05f else 1.0f,
+                        animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessMediumLow),
+                        label = "simulated_scale"
+                    )
 
                     Box(
                         modifier = Modifier
-                            .size(width = 180.dp, height = 52.dp)
+                            .offset { androidx.compose.ui.unit.IntOffset(animatedDragOffset.roundToInt(), 0) }
+                            .graphicsLayer {
+                                scaleX = animatedTargetScale
+                                scaleY = animatedTargetScale
+                            }
+                            .size(width = 200.dp, height = 52.dp)
                             .clip(RoundedCornerShape(26.dp))
                             .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.15f))
                             .border(1.5.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(26.dp))
@@ -1940,12 +2129,14 @@ fun AnalyticsTab(
                             .pointerInput(Unit) {
                                 detectDragGestures(
                                     onDragStart = { offset ->
+                                        isDraggingTarget = true
                                         dragStartX = offset.x
                                         dragStartTime = System.currentTimeMillis()
                                         isSwipeHoldDetected = false
                                         currentDragDeltaX = 0f
                                     },
                                     onDragEnd = {
+                                        isDraggingTarget = false
                                         if (!isSwipeHoldDetected) {
                                             if (currentDragDeltaX > 25f) {
                                                 feedbackText = "Swipe Right!"
@@ -1955,6 +2146,11 @@ fun AnalyticsTab(
                                                 onSimulateGesture("SWIPE_LEFT")
                                             }
                                         }
+                                        currentDragDeltaX = 0f
+                                    },
+                                    onDragCancel = {
+                                        isDraggingTarget = false
+                                        currentDragDeltaX = 0f
                                     },
                                     onDrag = { change, dragAmount ->
                                         change.consume()
@@ -1975,15 +2171,39 @@ fun AnalyticsTab(
                             },
                         contentAlignment = Alignment.Center
                     ) {
-                        Text(
-                            text = feedbackText.uppercase(),
-                            color = MaterialTheme.colorScheme.primary,
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Bold,
-                            fontFamily = FontFamily.SansSerif,
-                            letterSpacing = 0.5.sp,
-                            textAlign = TextAlign.Center
-                        )
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary.copy(
+                                    alpha = if (currentDragDeltaX < -10f) 1f else 0.35f
+                                ),
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Text(
+                                text = feedbackText.uppercase(),
+                                color = MaterialTheme.colorScheme.primary,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                fontFamily = FontFamily.SansSerif,
+                                letterSpacing = 0.5.sp,
+                                textAlign = TextAlign.Center
+                            )
+                            Icon(
+                                imageVector = Icons.Filled.ArrowForward,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary.copy(
+                                    alpha = if (currentDragDeltaX > 10f) 1f else 0.35f
+                                ),
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
                     }
 
                     Spacer(modifier = Modifier.height(14.dp))
@@ -2087,6 +2307,7 @@ fun isWriteSettingsGranted(context: Context): Boolean {
 data class AppEntry(
     val label: String,
     val packageName: String,
+    val className: String? = null,
     val icon: ImageBitmap?
 )
 
@@ -2108,13 +2329,14 @@ object AppInfoCache {
             try {
                 val label = resolveInfo.loadLabel(pm).toString()
                 val pkg = resolveInfo.activityInfo.packageName
+                val cls = resolveInfo.activityInfo.name
                 val iconDrawable = resolveInfo.loadIcon(pm)
                 val bitmap = iconDrawable.toBitmapOrNull()
-                AppEntry(label = label, packageName = pkg, icon = bitmap?.asImageBitmap())
-            } catch (e: Exception) {
+                AppEntry(label = label, packageName = pkg, className = cls, icon = bitmap?.asImageBitmap())
+            } catch (e: Throwable) {
                 null
             }
-        }.sortedBy { it.label.lowercase() }
+        }.distinctBy { it.packageName }.sortedBy { it.label.lowercase() }
         cachedLauncherApps = list
         return list
     }
@@ -2128,13 +2350,14 @@ object AppInfoCache {
             try {
                 val label = resolveInfo.loadLabel(pm).toString()
                 val pkg = resolveInfo.activityInfo.packageName
+                val cls = resolveInfo.activityInfo.name
                 val iconDrawable = resolveInfo.loadIcon(pm)
                 val bitmap = iconDrawable.toBitmapOrNull()
-                AppEntry(label = label, packageName = pkg, icon = bitmap?.asImageBitmap())
-            } catch (e: Exception) {
+                AppEntry(label = label, packageName = pkg, className = cls, icon = bitmap?.asImageBitmap())
+            } catch (e: Throwable) {
                 null
             }
-        }.sortedBy { it.label.lowercase() }
+        }.distinctBy { "${it.packageName}:${it.className}" }.sortedBy { it.label.lowercase() }
         cachedShortcutApps = list
         return list
     }
@@ -2159,7 +2382,7 @@ fun Drawable.toBitmapOrNull(): Bitmap? {
         setBounds(0, 0, canvas.width, canvas.height)
         draw(canvas)
         bitmap
-    } catch (e: Exception) {
+    } catch (e: Throwable) {
         null
     }
 }
@@ -2201,24 +2424,30 @@ fun ActionPickerSheet(
 
     // Query installed launcher apps (cached in-memory, loads only when Open App category is visited)
     val installedApps by produceState<List<AppEntry>>(initialValue = AppInfoCache.cachedLauncherApps ?: emptyList(), selectedCategory) {
-        if (selectedCategory == 2 && value.isEmpty()) {
+        if (selectedCategory == 1 && value.isEmpty()) {
             withContext(Dispatchers.IO) {
                 value = AppInfoCache.getOrLoadLauncherApps(context)
             }
         }
     }
 
-    // Query apps supporting CREATE_SHORTCUT (cached in-memory, loads only when Shortcuts category is visited)
-    val shortcutApps by produceState<List<AppEntry>>(initialValue = AppInfoCache.cachedShortcutApps ?: emptyList(), selectedCategory) {
-        if (selectedCategory == 3 && value.isEmpty()) {
+    // Query all shortcuts (App shortcuts: YouTube Shorts, Subscriptions, WhatsApp chats, Chrome, etc., custom creators, system)
+    var shortcutSearchQuery by remember { mutableStateOf("") }
+
+    val allShortcuts by produceState<List<AppShortcutItem>>(
+        initialValue = AppShortcutHelper.cachedAppShortcuts ?: emptyList(),
+        selectedCategory
+    ) {
+        if (selectedCategory == 2) {
             withContext(Dispatchers.IO) {
-                value = AppInfoCache.getOrLoadShortcutApps(context)
+                value = AppShortcutHelper.getOrLoadAllShortcuts(context)
             }
         }
     }
 
     // Shortcut creator launcher
     var pendingShortcutPkg by remember { mutableStateOf<String?>(null) }
+    var pendingShortcutAppName by remember { mutableStateOf<String?>(null) }
     val shortcutPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -2233,7 +2462,8 @@ fun ActionPickerSheet(
             val shortcutName = data.getStringExtra(Intent.EXTRA_SHORTCUT_NAME) ?: "Custom Shortcut"
             if (shortcutIntent != null) {
                 val uri = shortcutIntent.toUri(Intent.URI_INTENT_SCHEME)
-                onActionSelected("SHORTCUT", pendingShortcutPkg, "Shortcut: $shortcutName", uri)
+                val prefix = pendingShortcutAppName ?: "Shortcut"
+                onActionSelected("SHORTCUT", pendingShortcutPkg, "Shortcut: $prefix - $shortcutName", uri)
             }
         }
     }
@@ -2254,19 +2484,6 @@ fun ActionPickerSheet(
         Triple("SPY_CAM_FRONT", null, "Spy Cam (Silent Front Record)"),
         Triple("VOLUME_UP", null, "Raise Music Volume"),
         Triple("VOLUME_DOWN", null, "Lower Music Volume")
-    )
-
-    val instantShortcuts = listOf(
-        ShortcutOption("SHORTCUT_SELFIE", "Selfie Camera", "Launch front camera directly", Icons.Default.CameraAlt),
-        ShortcutOption("SHORTCUT_SEARCH", "Google Web Search", "Open Google Search immediately", Icons.Default.Search),
-        ShortcutOption("SHORTCUT_ALARM", "Clock & Alarms", "Quick access to alarms and timers", Icons.Default.Alarm),
-        ShortcutOption("SHORTCUT_EMAIL", "Compose Email", "Create a draft in default email app", Icons.Default.Mail),
-        ShortcutOption("SHORTCUT_BATTERY", "Battery Saver & Usage", "Quick toggle battery settings and stats", Icons.Default.BatteryChargingFull),
-        ShortcutOption("SHORTCUT_WIFI", "Wi-Fi Settings", "Manage wireless networks and connections", Icons.Default.Wifi),
-        ShortcutOption("SHORTCUT_BLUETOOTH", "Bluetooth Settings", "Pair and switch Bluetooth accessories", Icons.Default.Bluetooth),
-        ShortcutOption("SHORTCUT_SOUND", "Sound & Vibration", "Quick volume and sound profile settings", Icons.Default.VolumeUp),
-        ShortcutOption("SHORTCUT_DISPLAY", "Display & Timeout", "Screen timeout and dark mode settings", Icons.Default.Brightness6),
-        ShortcutOption("SHORTCUT_APPS", "Manage Apps", "View installed applications and storage", Icons.Default.Apps)
     )
 
     val categories = listOf("System", "Open App", "Shortcuts")
@@ -2300,7 +2517,7 @@ fun ActionPickerSheet(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(max = 480.dp)
+                    .heightIn(max = 540.dp)
             ) {
                 // Category Tabs
                 PrimaryTabRow(
@@ -2517,6 +2734,64 @@ fun ActionPickerSheet(
                                     }
                                 }
                             }
+
+                            // WALLPAPER CHANGER SECTION (Only shown for non-hold gestures as requested)
+                            if (!isHold) {
+                                item {
+                                    Card(
+                                        shape = RoundedCornerShape(14.dp),
+                                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.4f)),
+                                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.secondary.copy(alpha = 0.3f)),
+                                        modifier = Modifier.fillMaxWidth().padding(top = 10.dp, bottom = 4.dp)
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Wallpaper,
+                                                contentDescription = null,
+                                                tint = MaterialTheme.colorScheme.secondary,
+                                                modifier = Modifier.size(20.dp)
+                                            )
+                                            Spacer(modifier = Modifier.width(10.dp))
+                                            Column {
+                                                Text(
+                                                    text = "Wallpaper Changer",
+                                                    fontWeight = FontWeight.Bold,
+                                                    fontSize = 13.sp,
+                                                    color = MaterialTheme.colorScheme.secondary
+                                                )
+                                                Text(
+                                                    text = "Trigger wallpaper changes directly via this notch gesture",
+                                                    fontSize = 11.sp,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+
+                                val wallpaperActions = listOf(
+                                    Triple("WALLPAPER_NEXT", "Next Wallpaper", "Cycle next wallpaper (works with active live or static wallpaper)"),
+                                    Triple("WALLPAPER_PREVIOUS", "Previous Wallpaper", "Cycle previous wallpaper (works with active live or static wallpaper)"),
+                                    Triple("WALLPAPER_RANDOM", "Random Wallpaper", "Random wallpaper (works with active live or static wallpaper)"),
+                                    Triple("WALLPAPER_HOME_NEXT", "Next Home Wallpaper", "Change only the Home screen wallpaper"),
+                                    Triple("WALLPAPER_LOCK_NEXT", "Next Lock Screen Wallpaper", "Change only the Lock screen wallpaper"),
+                                    Triple("WALLPAPER_IMAGES_NEXT", "Next Wallpaper (Selected Images)", "Cycle wallpapers from selected custom photos"),
+                                    Triple("WALLPAPER_FOLDER_NEXT", "Next Wallpaper (Folder)", "Cycle wallpapers from selected folder")
+                                )
+
+                                items(wallpaperActions, key = { it.first }) { (type, label, sub) ->
+                                    val isSelected = currentAction == type
+                                    ActionRowItem(
+                                        title = label,
+                                        subtitle = sub,
+                                        isSelected = isSelected,
+                                        onClick = { onActionSelected(type, null, label, null) }
+                                    )
+                                }
+                            }
                         }
                     }
                     1 -> {
@@ -2569,7 +2844,7 @@ fun ActionPickerSheet(
                                 }
                             } else {
                                 LazyColumn(
-                                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                                    verticalArrangement = Arrangement.spacedBy(4.dp),
                                     modifier = Modifier.fillMaxWidth().weight(1f)
                                 ) {
                                     items(filteredApps, key = { it.packageName }) { app ->
@@ -2577,49 +2852,54 @@ fun ActionPickerSheet(
                                         Row(
                                             modifier = Modifier
                                                 .fillMaxWidth()
-                                                .clip(RoundedCornerShape(24.dp))
-                                                .background(if (isSelected) MaterialTheme.colorScheme.primary.copy(alpha = 0.12f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f))
+                                                .clip(RoundedCornerShape(12.dp))
+                                                .background(if (isSelected) MaterialTheme.colorScheme.primary.copy(alpha = 0.12f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.25f))
                                                 .border(
                                                     width = 1.dp,
-                                                    color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant,
-                                                    shape = RoundedCornerShape(24.dp)
+                                                    color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f),
+                                                    shape = RoundedCornerShape(12.dp)
                                                 )
                                                 .clickable {
                                                     onActionSelected("LAUNCH_APP", app.packageName, "Open ${app.label}", null)
                                                 }
-                                                .padding(10.dp),
+                                                .padding(horizontal = 10.dp, vertical = 7.dp),
                                             verticalAlignment = Alignment.CenterVertically
                                         ) {
                                             if (app.icon != null) {
                                                 Image(
                                                     bitmap = app.icon,
                                                     contentDescription = app.label,
-                                                    modifier = Modifier.size(36.dp).clip(CircleShape)
+                                                    modifier = Modifier.size(30.dp).clip(CircleShape)
                                                 )
                                             } else {
                                                 Box(
-                                                    modifier = Modifier.size(36.dp).clip(CircleShape).background(MaterialTheme.colorScheme.surfaceVariant),
+                                                    modifier = Modifier.size(30.dp).clip(CircleShape).background(MaterialTheme.colorScheme.surfaceVariant),
                                                     contentAlignment = Alignment.Center
                                                 ) {
-                                                    Icon(Icons.Default.Apps, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(20.dp))
+                                                    Icon(Icons.Default.Apps, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(16.dp))
                                                 }
                                             }
-                                            Spacer(modifier = Modifier.width(12.dp))
+                                            Spacer(modifier = Modifier.width(10.dp))
                                             Column(modifier = Modifier.weight(1f)) {
                                                 Text(
                                                     text = app.label,
                                                     fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
-                                                    fontSize = 14.sp,
-                                                    color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+                                                    fontSize = 13.sp,
+                                                    color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
                                                 )
                                                 Text(
                                                     text = app.packageName,
                                                     fontSize = 10.sp,
-                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
                                                 )
                                             }
                                             if (isSelected) {
-                                                Icon(Icons.Default.Check, contentDescription = "Selected", tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
+                                                Spacer(modifier = Modifier.width(6.dp))
+                                                Icon(Icons.Default.Check, contentDescription = "Selected", tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(16.dp))
                                             }
                                         }
                                     }
@@ -2628,130 +2908,206 @@ fun ActionPickerSheet(
                         }
                     }
                     2 -> {
-                        // Shortcuts Tab
-                        LazyColumn(
-                            verticalArrangement = Arrangement.spacedBy(8.dp),
-                            modifier = Modifier.fillMaxWidth().weight(1f)
-                        ) {
-                            // Native App Shortcuts Section
-                            if (shortcutApps.isNotEmpty()) {
-                                item {
-                                    Text(
-                                        text = "APP SHORTCUTS CREATOR",
-                                        fontSize = 11.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        color = MaterialTheme.colorScheme.primary,
-                                        modifier = Modifier.padding(vertical = 4.dp)
-                                    )
-                                    Text(
-                                        text = "Select an app to pick its native shortcut (e.g. WhatsApp chats, Maps routes, Contacts):",
-                                        fontSize = 11.sp,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        modifier = Modifier.padding(bottom = 6.dp)
-                                    )
+                        // Shortcuts Tab: shows ALL apps app shortcuts (YouTube Shorts, Subscriptions, WhatsApp chats, etc.)
+                        val filteredShortcuts = remember(allShortcuts, shortcutSearchQuery) {
+                            if (shortcutSearchQuery.isBlank()) {
+                                allShortcuts
+                            } else {
+                                allShortcuts.filter { item ->
+                                    item.title.contains(shortcutSearchQuery, ignoreCase = true) ||
+                                    item.appName.contains(shortcutSearchQuery, ignoreCase = true) ||
+                                    (item.subtitle?.contains(shortcutSearchQuery, ignoreCase = true) == true)
                                 }
+                            }
+                        }
 
-                                items(shortcutApps, key = { it.packageName }) { app ->
-                                    Row(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .clip(RoundedCornerShape(24.dp))
-                                            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f))
-                                            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(24.dp))
-                                            .clickable {
-                                                pendingShortcutPkg = app.packageName
-                                                val intent = Intent(Intent.ACTION_CREATE_SHORTCUT).apply {
-                                                    setPackage(app.packageName)
-                                                }
-                                                shortcutPickerLauncher.launch(intent)
-                                            }
-                                            .padding(10.dp),
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        if (app.icon != null) {
-                                            Image(
-                                                bitmap = app.icon,
-                                                contentDescription = app.label,
-                                                modifier = Modifier.size(32.dp).clip(CircleShape)
-                                            )
-                                        } else {
-                                            Icon(Icons.Default.Shortcut, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(24.dp))
+                        Column(modifier = Modifier.fillMaxWidth().weight(1f)) {
+                            // Search bar
+                            OutlinedTextField(
+                                value = shortcutSearchQuery,
+                                onValueChange = { shortcutSearchQuery = it },
+                                placeholder = { Text("Search shortcuts (e.g. Shorts, WhatsApp, Alarms)...", fontSize = 12.sp) },
+                                leadingIcon = {
+                                    Icon(Icons.Default.Search, contentDescription = null, modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
+                                },
+                                trailingIcon = {
+                                    if (shortcutSearchQuery.isNotEmpty()) {
+                                        IconButton(onClick = { shortcutSearchQuery = "" }) {
+                                            Icon(Icons.Default.Close, contentDescription = "Clear", modifier = Modifier.size(14.dp))
                                         }
-                                        Spacer(modifier = Modifier.width(10.dp))
-                                        Column(modifier = Modifier.weight(1f)) {
-                                            Text(text = "Pick from ${app.label}", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
-                                            Text(text = "Create shortcut with ${app.label}", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                        }
-                                        Icon(Icons.Default.ChevronRight, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(16.dp))
                                     }
-                                }
+                                },
+                                singleLine = true,
+                                shape = RoundedCornerShape(12.dp),
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    unfocusedContainerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.25f),
+                                    focusedContainerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                                    unfocusedBorderColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f)
+                                ),
+                                modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp)
+                            )
 
-                                item {
-                                    Spacer(modifier = Modifier.height(8.dp))
-                                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-                                    Spacer(modifier = Modifier.height(4.dp))
-                                }
-                            }
-
-                            // Built-in Instant Shortcuts
-                            item {
-                                Text(
-                                    text = "FAST UTILITY SHORTCUTS",
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = MaterialTheme.colorScheme.primary,
-                                    modifier = Modifier.padding(vertical = 4.dp)
-                                )
-                            }
-
-                            items(instantShortcuts, key = { it.id }) { shortcut ->
-                                val isSelected = currentAction == "SHORTCUT" && currentExtra == shortcut.id
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .clip(RoundedCornerShape(24.dp))
-                                        .background(if (isSelected) MaterialTheme.colorScheme.primary.copy(alpha = 0.12f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f))
-                                        .border(
-                                            width = 1.dp,
-                                            color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant,
-                                            shape = RoundedCornerShape(24.dp)
-                                        )
-                                        .clickable {
-                                            onActionSelected("SHORTCUT", null, "Shortcut: ${shortcut.title}", shortcut.id)
-                                        }
-                                        .padding(10.dp),
-                                    verticalAlignment = Alignment.CenterVertically
+                            if (filteredShortcuts.isEmpty()) {
+                                Box(
+                                    modifier = Modifier.fillMaxWidth().padding(vertical = 20.dp),
+                                    contentAlignment = Alignment.Center
                                 ) {
-                                    Box(
-                                        modifier = Modifier
-                                            .size(36.dp)
-                                            .clip(RoundedCornerShape(10.dp))
-                                            .background(if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant),
-                                        contentAlignment = Alignment.Center
-                                    ) {
-                                        Icon(
-                                            imageVector = shortcut.icon,
-                                            contentDescription = shortcut.title,
-                                            tint = if (isSelected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.primary,
-                                            modifier = Modifier.size(18.dp)
-                                        )
-                                    }
-                                    Spacer(modifier = Modifier.width(12.dp))
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text(
-                                            text = shortcut.title,
-                                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.SemiBold,
-                                            fontSize = 13.sp,
-                                            color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
-                                        )
-                                        Text(
-                                            text = shortcut.subtitle,
-                                            fontSize = 10.sp,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                    }
-                                    if (isSelected) {
-                                        Icon(Icons.Default.Check, contentDescription = "Selected", tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
+                                    Text(
+                                        if (shortcutSearchQuery.isBlank()) "No shortcuts available" else "No matching shortcuts found",
+                                        fontSize = 12.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            } else {
+                                val grouped = remember(filteredShortcuts) {
+                                    filteredShortcuts.groupBy { it.appName }
+                                }
+
+                                LazyColumn(
+                                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                                    modifier = Modifier.fillMaxWidth().weight(1f)
+                                ) {
+                                    grouped.forEach { (appName, groupItems) ->
+                                        item(key = "header_$appName") {
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                modifier = Modifier.padding(top = 6.dp, bottom = 2.dp)
+                                            ) {
+                                                val headerIcon = groupItems.firstOrNull { it.iconBitmap != null }?.iconBitmap
+                                                if (headerIcon != null) {
+                                                    Image(
+                                                        bitmap = headerIcon,
+                                                        contentDescription = appName,
+                                                        modifier = Modifier.size(14.dp).clip(CircleShape)
+                                                    )
+                                                    Spacer(modifier = Modifier.width(6.dp))
+                                                }
+                                                Text(
+                                                    text = appName,
+                                                    fontSize = 11.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = MaterialTheme.colorScheme.primary
+                                                )
+                                                Spacer(modifier = Modifier.width(4.dp))
+                                                Text(
+                                                    text = "(${groupItems.size})",
+                                                    fontSize = 10.sp,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                )
+                                            }
+                                        }
+
+                                        items(groupItems, key = { it.id }) { shortcut ->
+                                            val isSelected = currentAction == "SHORTCUT" && (currentExtra == shortcut.intentUri || currentExtra == shortcut.id)
+                                            Row(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .clip(RoundedCornerShape(12.dp))
+                                                    .background(if (isSelected) MaterialTheme.colorScheme.primary.copy(alpha = 0.12f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.25f))
+                                                    .border(
+                                                        width = 1.dp,
+                                                        color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f),
+                                                        shape = RoundedCornerShape(12.dp)
+                                                    )
+                                                    .clickable {
+                                                        if (shortcut.isCreator) {
+                                                            pendingShortcutPkg = shortcut.packageName
+                                                            pendingShortcutAppName = shortcut.appName
+                                                            val intent = Intent(Intent.ACTION_CREATE_SHORTCUT).apply {
+                                                                if (shortcut.creatorClassName != null) {
+                                                                    setClassName(shortcut.packageName, shortcut.creatorClassName)
+                                                                } else {
+                                                                    setPackage(shortcut.packageName)
+                                                                }
+                                                            }
+                                                            try {
+                                                                shortcutPickerLauncher.launch(intent)
+                                                            } catch (_: Exception) {
+                                                                Toast.makeText(context, "Cannot open shortcut picker for ${shortcut.appName}", Toast.LENGTH_SHORT).show()
+                                                            }
+                                                        } else {
+                                                            onActionSelected(
+                                                                "SHORTCUT",
+                                                                shortcut.packageName,
+                                                                "Shortcut: ${shortcut.appName} - ${shortcut.title}",
+                                                                shortcut.intentUri
+                                                            )
+                                                        }
+                                                    }
+                                                    .padding(horizontal = 10.dp, vertical = 7.dp),
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Box(
+                                                    modifier = Modifier
+                                                        .size(30.dp)
+                                                        .clip(RoundedCornerShape(8.dp))
+                                                        .background(if (isSelected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)),
+                                                    contentAlignment = Alignment.Center
+                                                ) {
+                                                    if (shortcut.iconBitmap != null) {
+                                                        Image(
+                                                            bitmap = shortcut.iconBitmap,
+                                                            contentDescription = shortcut.title,
+                                                            modifier = Modifier.size(20.dp).clip(CircleShape)
+                                                        )
+                                                    } else if (shortcut.iconVector != null) {
+                                                        Icon(
+                                                            imageVector = shortcut.iconVector,
+                                                            contentDescription = shortcut.title,
+                                                            tint = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                                            modifier = Modifier.size(16.dp)
+                                                        )
+                                                    } else {
+                                                        Icon(
+                                                            imageVector = Icons.Default.Shortcut,
+                                                            contentDescription = shortcut.title,
+                                                            tint = MaterialTheme.colorScheme.primary,
+                                                            modifier = Modifier.size(16.dp)
+                                                        )
+                                                    }
+                                                }
+
+                                                Spacer(modifier = Modifier.width(10.dp))
+
+                                                Column(modifier = Modifier.weight(1f)) {
+                                                    Text(
+                                                        text = shortcut.title,
+                                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.SemiBold,
+                                                        fontSize = 13.sp,
+                                                        color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                                                        maxLines = 1,
+                                                        overflow = TextOverflow.Ellipsis
+                                                    )
+                                                    if (!shortcut.subtitle.isNullOrBlank()) {
+                                                        Text(
+                                                            text = shortcut.subtitle,
+                                                            fontSize = 10.sp,
+                                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                            maxLines = 1,
+                                                            overflow = TextOverflow.Ellipsis
+                                                        )
+                                                    }
+                                                }
+
+                                                if (isSelected) {
+                                                    Spacer(modifier = Modifier.width(6.dp))
+                                                    Icon(
+                                                        Icons.Default.Check,
+                                                        contentDescription = "Selected",
+                                                        tint = MaterialTheme.colorScheme.primary,
+                                                        modifier = Modifier.size(16.dp)
+                                                    )
+                                                } else if (shortcut.isCreator) {
+                                                    Spacer(modifier = Modifier.width(6.dp))
+                                                    Icon(
+                                                        Icons.Default.ChevronRight,
+                                                        contentDescription = null,
+                                                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
+                                                        modifier = Modifier.size(14.dp)
+                                                    )
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -2773,15 +3129,15 @@ fun ActionRowItem(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(24.dp))
-            .background(if (isSelected) MaterialTheme.colorScheme.primary.copy(alpha = 0.12f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f))
+            .clip(RoundedCornerShape(12.dp))
+            .background(if (isSelected) MaterialTheme.colorScheme.primary.copy(alpha = 0.12f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.25f))
             .border(
                 width = 1.dp,
-                color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant,
-                shape = RoundedCornerShape(24.dp)
+                color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f),
+                shape = RoundedCornerShape(12.dp)
             )
             .clickable(onClick = onClick)
-            .padding(12.dp),
+            .padding(horizontal = 12.dp, vertical = 9.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween
     ) {
@@ -2789,7 +3145,7 @@ fun ActionRowItem(
             Text(
                 text = title,
                 color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
-                fontSize = 14.sp,
+                fontSize = 13.sp,
                 fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium
             )
             Text(
@@ -2803,7 +3159,7 @@ fun ActionRowItem(
                 imageVector = Icons.Default.Check,
                 contentDescription = "Selected",
                 tint = MaterialTheme.colorScheme.primary,
-                modifier = Modifier.size(18.dp)
+                modifier = Modifier.size(16.dp)
             )
         }
     }

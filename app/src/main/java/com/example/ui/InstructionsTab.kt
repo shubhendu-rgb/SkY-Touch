@@ -18,6 +18,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -66,10 +67,11 @@ val instructionsList = listOf(
         icon = Icons.Filled.AutoAwesome,
         description = "Inline text expansion, AI rewriting, and advanced editing from any text box on your phone.",
         steps = listOf(
-            "Instant Snippets: Create abbreviations. Type '?brb' in any app to auto-expand to 'Be right back!'.",
-            "Dynamic Multiplier: Type a word followed by ? and a number to multiply it (e.g. 'hi ?5'). Add '_' for line-by-line (e.g. 'hi ?5_'), ',' for inline spaces, or rely on your default Settings preference.",
-            "AI Assistant: Type a prompt followed by ? and a number (e.g. 'Summarize this ?50'). The AI will replace your text with a 50-word response inline.",
-            "Inline Editing: Type '?copy', '?cut', '?paste', or '?clear' at the end of a text box to execute clipboard actions instantly."
+            "AI Triggers: Type any text followed by '?improve', '?shorten', '?expand', '?formal', '?casual', '?emoji', '?human', '?reply', or '?fix' to transform your text instantly with Gemini.",
+            "Inline Editing & Clipboard: Type '?replace' (replace text with clipboard), '?paste', '?undo' (restore original text), '?copy', or '?cut' at the end of any input field.",
+            "Dynamic Translation: Type '?translate:es', '?translate:fr', etc. to translate any text directly into the specified language.",
+            "Instant Text Snippets: Type abbreviations like '?addr' to auto-expand to predefined addresses or full templates.",
+            "Dynamic Word Multiplier: Type a word followed by '?' and a count (e.g. 'hi ?5') to repeat it inline."
         )
     ),
     InstructionItem(
@@ -174,7 +176,7 @@ fun InstructionCard(item: InstructionItem) {
                     imageVector = Icons.Filled.ExpandMore,
                     contentDescription = "Expand",
                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.rotate(rotation)
+                    modifier = Modifier.graphicsLayer { rotationZ = rotation }
                 )
             }
 

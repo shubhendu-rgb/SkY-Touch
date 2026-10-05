@@ -14,6 +14,9 @@ interface WallpaperConfigDao {
     @Query("SELECT * FROM wallpaper_config WHERE screenType = :screenType")
     suspend fun getConfig(screenType: String): WallpaperConfigEntity?
 
+    @Query("SELECT * FROM wallpaper_config")
+    suspend fun getAllConfigs(): List<WallpaperConfigEntity>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun saveConfig(config: WallpaperConfigEntity)
 }

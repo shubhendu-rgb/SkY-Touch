@@ -1,9 +1,11 @@
 package com.example.service
 
 import android.app.Notification
+import android.app.PendingIntent
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -13,14 +15,23 @@ import android.os.VibratorManager
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.widget.Toast
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Notifications
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.ui.graphics.Color
 import com.example.data.AppDatabase
 import com.example.data.DetectedCodeEntity
 import com.example.data.NotchRepository
+import com.example.ui.island.CapsuleType
+import com.example.ui.island.DynamicNotchManager
+import com.example.ui.island.MiniCapsuleEvent
+import com.example.ui.island.NotificationActionItem
 import com.example.util.CodeDetector
 import com.example.util.OtpNotificationHelper
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 
 class OtpNotificationListenerService : NotificationListenerService() {
@@ -38,6 +49,9 @@ class OtpNotificationListenerService : NotificationListenerService() {
     override fun onDestroy() {
         super.onDestroy()
         isRunning = false
+        try {
+            serviceScope.cancel()
+        } catch (_: Exception) {}
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
@@ -62,6 +76,10 @@ class OtpNotificationListenerService : NotificationListenerService() {
             if (bigText.isNotBlank() && bigText != text) add(bigText)
             if (subText.isNotBlank()) add(subText)
         }.joinToString(" ")
+
+        if (combinedText.isNotBlank()) {
+            handleDynamicNotchNotification(sbn, notification, extras, title, text, bigText, subText)
+        }
 
         if (combinedText.isBlank()) return
 
@@ -123,6 +141,109 @@ class OtpNotificationListenerService : NotificationListenerService() {
             } catch (_: Exception) {
                 // Ignore background extraction failures gracefully
             }
+        }
+    }
+
+    override fun onNotificationRemoved(sbn: StatusBarNotification?) {
+        super.onNotificationRemoved(sbn)
+        if (sbn == null) return
+        DynamicNotchManager.clearLiveActivity(sbn.packageName)
+    }
+
+    private fun handleDynamicNotchNotification(
+        sbn: StatusBarNotification,
+        notification: Notification,
+        extras: android.os.Bundle,
+        title: String,
+        text: String,
+        bigText: String,
+        subText: String
+    ) {
+        try {
+            if (!DynamicNotchManager.isDynamicNotchEnabled.value) return
+            val behavior = DynamicNotchManager.activeBehavior.value
+
+            val isOngoing = sbn.isOngoing || ((notification.flags and Notification.FLAG_ONGOING_EVENT) != 0)
+            val isSilent = notification.priority <= Notification.PRIORITY_LOW
+
+            val isMediaOrLive = extras.containsKey(Notification.EXTRA_MEDIA_SESSION) ||
+                    notification.actions?.any { it.title?.toString()?.contains("pause", ignoreCase = true) == true || it.title?.toString()?.contains("play", ignoreCase = true) == true } == true
+
+            // Live Activity Handling
+            if (isMediaOrLive && behavior.liveActivities) {
+                val appLabel = try {
+                    packageManager.getApplicationLabel(packageManager.getApplicationInfo(sbn.packageName, 0)).toString()
+                } catch (_: Exception) {
+                    sbn.packageName
+                }
+                val liveEvent = MiniCapsuleEvent(
+                    id = "live_${sbn.packageName}",
+                    type = CapsuleType.LIVE_ACTIVITY,
+                    title = if (title.isNotBlank()) title else appLabel,
+                    subtitle = text.ifBlank { bigText.ifBlank { subText } },
+                    iconVector = Icons.Default.PlayArrow,
+                    accentColor = Color(0xFF10B981),
+                    durationSeconds = 60,
+                    packageName = sbn.packageName
+                )
+                DynamicNotchManager.setLiveActivity(liveEvent)
+                return
+            }
+
+            // Apply Notification Filters
+            if (isOngoing && !behavior.includeOngoingNotifications) return
+            if (isSilent && !behavior.includeSilentNotifications) return
+
+            // Extract Notification Action Buttons
+            val actionItems = if (behavior.showNotificationButtons && notification.actions != null) {
+                notification.actions.mapNotNull { action ->
+                    val actionTitle = action.title?.toString()
+                    if (!actionTitle.isNullOrBlank()) {
+                        NotificationActionItem(
+                            title = actionTitle,
+                            actionIntent = action.actionIntent
+                        )
+                    } else null
+                }
+            } else emptyList()
+
+            // Extract Quick Reply if available
+            var quickReplyIntent: PendingIntent? = null
+            var quickReplyKey: String? = null
+            if (behavior.quickReply && notification.actions != null) {
+                for (action in notification.actions) {
+                    val remoteInput = action.remoteInputs?.firstOrNull()
+                    if (remoteInput != null) {
+                        quickReplyIntent = action.actionIntent
+                        quickReplyKey = remoteInput.resultKey
+                        break
+                    }
+                }
+            }
+
+            val appLabel = try {
+                packageManager.getApplicationLabel(packageManager.getApplicationInfo(sbn.packageName, 0)).toString()
+            } catch (_: Exception) {
+                "Notification"
+            }
+
+            val capsuleEvent = MiniCapsuleEvent(
+                id = sbn.key ?: java.util.UUID.randomUUID().toString(),
+                type = CapsuleType.NOTIFICATION,
+                title = if (title.isNotBlank()) title else appLabel,
+                subtitle = text.ifBlank { bigText.ifBlank { subText } },
+                iconVector = Icons.Default.Notifications,
+                accentColor = Color(0xFF38BDF8),
+                durationSeconds = behavior.collapseAfterSeconds.coerceAtLeast(3),
+                packageName = sbn.packageName,
+                actionButtons = actionItems,
+                quickReplyIntent = quickReplyIntent,
+                quickReplyKey = quickReplyKey
+            )
+
+            DynamicNotchManager.postCapsuleEvent(capsuleEvent)
+        } catch (_: Exception) {
+            // Ignore notification interception error
         }
     }
 

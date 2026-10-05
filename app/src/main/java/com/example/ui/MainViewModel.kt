@@ -19,6 +19,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
@@ -33,7 +34,7 @@ data class MainUiState(
     val textSnippets: List<TextSnippetEntity> = emptyList()
 )
 
-class MainViewModel(private val repository: NotchRepository) : ViewModel() {
+class MainViewModel(val repository: NotchRepository) : ViewModel() {
 
     // Internal tester state
     private val _testGestureMessage = MutableStateFlow<String?>(null)
@@ -83,7 +84,8 @@ class MainViewModel(private val repository: NotchRepository) : ViewModel() {
             textAssistantConfig = assistant.textAssistantConfig,
             textSnippets = assistant.textSnippets
         )
-    }.stateIn(
+    }.flowOn(kotlinx.coroutines.Dispatchers.Default)
+    .stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(5000),
         initialValue = MainUiState()

@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ResolveInfo
+import android.util.LruCache
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -21,6 +22,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
@@ -38,6 +40,15 @@ data class AppInfo(
     val packageName: String,
     val isExcluded: Boolean
 )
+
+// In-memory icon cache to eliminate IPC calls during scroll
+object AppIconCache {
+    private val cache = LruCache<String, ImageBitmap>(150)
+    fun get(pkg: String): ImageBitmap? = cache.get(pkg)
+    fun put(pkg: String, bitmap: ImageBitmap) {
+        cache.put(pkg, bitmap)
+    }
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -60,15 +71,16 @@ fun ExcludedAppsTab(
         mutableStateOf(prefs.getStringSet("excluded_packages", emptySet()) ?: emptySet())
     }
 
-    // Load apps in background
-    LaunchedEffect(excludedPackages) {
+    // Load apps in background once - never reload on toggle
+    LaunchedEffect(Unit) {
         isLoading = true
-        scope.launch(Dispatchers.Default) {
+        withContext(Dispatchers.IO) {
             val pm = context.packageManager
             val intent = Intent(Intent.ACTION_MAIN, null).apply {
                 addCategory(Intent.CATEGORY_LAUNCHER)
             }
             val resolveInfos = pm.queryIntentActivities(intent, 0)
+            val currentExcluded = prefs.getStringSet("excluded_packages", emptySet()) ?: emptySet()
             
             val apps = resolveInfos.mapNotNull { info ->
                 val packageName = info.activityInfo.packageName
@@ -77,7 +89,7 @@ fun ExcludedAppsTab(
                     AppInfo(
                         label = label,
                         packageName = packageName,
-                        isExcluded = excludedPackages.contains(packageName)
+                        isExcluded = currentExcluded.contains(packageName)
                     )
                 } else {
                     null
@@ -93,15 +105,15 @@ fun ExcludedAppsTab(
     }
 
     fun toggleAppExclusion(packageName: String, shouldExclude: Boolean) {
-        val newSet = excludedPackages.toMutableSet()
-        if (shouldExclude) {
-            newSet.add(packageName)
-        } else {
-            newSet.remove(packageName)
+        val newSet = excludedPackages.toMutableSet().apply {
+            if (shouldExclude) add(packageName) else remove(packageName)
         }
-        
-        prefs.edit().putStringSet("excluded_packages", newSet).apply()
         excludedPackages = newSet
+        
+        // Save preferences asynchronously off the UI thread
+        scope.launch(Dispatchers.IO) {
+            prefs.edit().putStringSet("excluded_packages", newSet).apply()
+        }
         
         // Update local memory list directly for snappy response
         appsList = appsList.map {
@@ -324,12 +336,23 @@ fun AppItemRow(
     val context = LocalContext.current
     val pm = remember { context.packageManager }
 
-    val iconBitmap = remember(app.packageName) {
-        try {
-            val drawable = pm.getApplicationIcon(app.packageName)
-            drawable.toBitmap().asImageBitmap()
-        } catch (e: Exception) {
-            null
+    val iconBitmap by produceState<ImageBitmap?>(
+        initialValue = AppIconCache.get(app.packageName),
+        key1 = app.packageName
+    ) {
+        if (value != null) return@produceState
+        val loaded = withContext(Dispatchers.IO) {
+            try {
+                val drawable = pm.getApplicationIcon(app.packageName)
+                val bmp = drawable.toBitmap(width = 96, height = 96)
+                bmp.asImageBitmap()
+            } catch (_: Exception) {
+                null
+            }
+        }
+        if (loaded != null) {
+            AppIconCache.put(app.packageName, loaded)
+            value = loaded
         }
     }
 
@@ -355,9 +378,10 @@ fun AppItemRow(
                     .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)),
                 contentAlignment = Alignment.Center
             ) {
-                if (iconBitmap != null) {
+                val currentIcon = iconBitmap
+                if (currentIcon != null) {
                     Image(
-                        bitmap = iconBitmap,
+                        bitmap = currentIcon,
                         contentDescription = null,
                         modifier = Modifier.size(32.dp)
                     )

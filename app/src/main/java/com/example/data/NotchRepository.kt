@@ -15,6 +15,7 @@ class NotchRepository(private val db: AppDatabase) {
     private val sideDeckConfigDao = db.sideDeckConfigDao()
     private val codeDetectionDao = db.codeDetectionDao()
     private val textAssistantDao = db.textAssistantDao()
+    private val autoClickDao = db.autoClickDao()
 
     val configFlow: Flow<NotchConfigEntity> = notchConfigDao.getConfigFlow().map {
         it ?: NotchConfigEntity()
@@ -31,6 +32,12 @@ class NotchRepository(private val db: AppDatabase) {
     val textAssistantConfigFlow: Flow<TextAssistantConfigEntity> = textAssistantDao.getConfigFlow().map {
         it ?: TextAssistantConfigEntity()
     }
+
+    val autoClickConfigFlow: Flow<AutoClickConfigEntity> = autoClickDao.getConfigFlow().map {
+        it ?: AutoClickConfigEntity()
+    }
+
+    val autoClickPointsFlow: Flow<List<AutoClickPointEntity>> = autoClickDao.getPointsFlow()
 
     val snippetsFlow: Flow<List<TextSnippetEntity>> = textAssistantDao.getAllSnippetsFlow()
 
@@ -84,6 +91,34 @@ class NotchRepository(private val db: AppDatabase) {
 
     suspend fun updateTextAssistantConfig(config: TextAssistantConfigEntity) {
         textAssistantDao.insertOrUpdateConfig(config)
+    }
+
+    suspend fun updateAutoClickConfig(config: AutoClickConfigEntity) {
+        autoClickDao.insertOrUpdateConfig(config)
+    }
+
+    suspend fun insertAutoClickPoint(point: AutoClickPointEntity) {
+        autoClickDao.insertPoint(point)
+    }
+
+    suspend fun updateAutoClickPoint(point: AutoClickPointEntity) {
+        autoClickDao.updatePoint(point)
+    }
+
+    suspend fun deleteAutoClickPoint(id: Int) {
+        autoClickDao.deletePoint(id)
+    }
+
+    suspend fun deleteLastAutoClickPoint() {
+        autoClickDao.deleteLastPoint()
+    }
+
+    suspend fun clearAutoClickPoints() {
+        autoClickDao.clearAllPoints()
+    }
+
+    suspend fun getAutoClickPointsDirect(): List<AutoClickPointEntity> {
+        return autoClickDao.getPointsDirect()
     }
 
     suspend fun insertSnippet(snippet: TextSnippetEntity): Long {
@@ -156,10 +191,22 @@ class NotchRepository(private val db: AppDatabase) {
             textAssistantDao.insertOrUpdateConfig(TextAssistantConfigEntity())
         }
 
+        // Initialize AutoClick config
+        val currentAutoClickConfig = autoClickDao.getConfigDirect()
+        if (currentAutoClickConfig == null) {
+            autoClickDao.insertOrUpdateConfig(AutoClickConfigEntity())
+        }
+
         // Initialize default snippets
         val currentSnippets = textAssistantDao.getAllSnippetsDirect()
         if (currentSnippets.isEmpty()) {
             textAssistantDao.insertSnippets(getDefaultSnippets())
+        } else {
+            val existingKeywords = currentSnippets.map { it.triggerKeyword.lowercase().trim() }.toSet()
+            val missingSnippets = getDefaultSnippets().filter { it.triggerKeyword.lowercase().trim() !in existingKeywords }
+            if (missingSnippets.isNotEmpty()) {
+                textAssistantDao.insertSnippets(missingSnippets)
+            }
         }
 
         // Clean up removed gestures
@@ -180,8 +227,72 @@ class NotchRepository(private val db: AppDatabase) {
         }
     }
 
-    private fun getDefaultSnippets(): List<TextSnippetEntity> {
+    fun getDefaultSnippets(): List<TextSnippetEntity> {
         return listOf(
+            // AI smart transformations from user screenshots
+            TextSnippetEntity(
+                triggerKeyword = "improve",
+                isAiAction = true,
+                replacementText = "",
+                aiPromptInstruction = "Rewrite to improve clarity, flow, and coherence.",
+                isEnabled = true
+            ),
+            TextSnippetEntity(
+                triggerKeyword = "shorten",
+                isAiAction = true,
+                replacementText = "",
+                aiPromptInstruction = "Rewrite to be more concise while preserving the core meaning.",
+                isEnabled = true
+            ),
+            TextSnippetEntity(
+                triggerKeyword = "expand",
+                isAiAction = true,
+                replacementText = "",
+                aiPromptInstruction = "Rewrite with more detail. Elaborate only on what is stated or widely known - do not fabricate information.",
+                isEnabled = true
+            ),
+            TextSnippetEntity(
+                triggerKeyword = "formal",
+                isAiAction = true,
+                replacementText = "",
+                aiPromptInstruction = "Rewrite in a formal, professional tone.",
+                isEnabled = true
+            ),
+            TextSnippetEntity(
+                triggerKeyword = "casual",
+                isAiAction = true,
+                replacementText = "",
+                aiPromptInstruction = "Rewrite in a casual, friendly tone.",
+                isEnabled = true
+            ),
+            TextSnippetEntity(
+                triggerKeyword = "emoji",
+                isAiAction = true,
+                replacementText = "",
+                aiPromptInstruction = "Add relevant emojis throughout.",
+                isEnabled = true
+            ),
+            TextSnippetEntity(
+                triggerKeyword = "human",
+                isAiAction = true,
+                replacementText = "",
+                aiPromptInstruction = "Rewrite to sound naturally human, not AI-generated. Never use emdashes or semicolons, use commas or periods instead. Drop AI clichés and filler phrases. Use contractions, everyday words, and varied sentence lengths. Keep all facts, names, and numbers intact.",
+                isEnabled = true
+            ),
+            TextSnippetEntity(
+                triggerKeyword = "reply",
+                isAiAction = true,
+                replacementText = "",
+                aiPromptInstruction = "Generate a contextual reply to this message.",
+                isEnabled = true
+            ),
+            TextSnippetEntity(
+                triggerKeyword = "fix",
+                isAiAction = true,
+                replacementText = "",
+                aiPromptInstruction = "Fix grammar, spelling, and punctuation errors.",
+                isEnabled = true
+            ),
             // Local quick text expansions
             TextSnippetEntity(
                 triggerKeyword = "addr",
@@ -210,42 +321,6 @@ class NotchRepository(private val db: AppDatabase) {
                 replacementText = "¯\\_(ツ)_/¯",
                 aiPromptInstruction = "",
                 isEnabled = true
-            ),
-            // AI smart transformations
-            TextSnippetEntity(
-                triggerKeyword = "fix",
-                isAiAction = true,
-                replacementText = "",
-                aiPromptInstruction = "Fix all spelling, grammar, punctuation, and capitalization errors while preserving original tone. Output ONLY the polished text without explanations or quotes.",
-                isEnabled = true
-            ),
-            TextSnippetEntity(
-                triggerKeyword = "formal",
-                isAiAction = true,
-                replacementText = "",
-                aiPromptInstruction = "Rewrite this message into a polite, respectful, and professional business tone. Output ONLY the rewritten text without quotes or preamble.",
-                isEnabled = true
-            ),
-            TextSnippetEntity(
-                triggerKeyword = "shorten",
-                isAiAction = true,
-                replacementText = "",
-                aiPromptInstruction = "Condense and summarize this text to make it clear, concise, and punchy while retaining all key points. Output ONLY the shortened text.",
-                isEnabled = true
-            ),
-            TextSnippetEntity(
-                triggerKeyword = "reply",
-                isAiAction = true,
-                replacementText = "",
-                aiPromptInstruction = "Generate a thoughtful, friendly, and helpful direct reply to this message. Output ONLY the response text.",
-                isEnabled = true
-            ),
-            TextSnippetEntity(
-                triggerKeyword = "translate",
-                isAiAction = true,
-                replacementText = "",
-                aiPromptInstruction = "Translate this text into fluent, natural English (or if already in English, translate to Spanish). Output ONLY the translation.",
-                isEnabled = true
             )
         )
     }
@@ -253,14 +328,14 @@ class NotchRepository(private val db: AppDatabase) {
 
     private fun getDefaultActions(): List<GestureActionEntity> {
         return listOf(
-            GestureActionEntity("SINGLE_TAP", "SCREENSHOT", label = "Take Screenshot"),
-            GestureActionEntity("DOUBLE_TAP", "FLASHLIGHT", label = "Toggle Flashlight"),
-            GestureActionEntity("TRIPLE_TAP", "MEDIA_PLAY_PAUSE", label = "Media Play / Pause"),
-            GestureActionEntity("LONG_PRESS", "QUICK_SETTINGS", label = "Open Quick Settings"),
-            GestureActionEntity("SWIPE_LEFT", "BACK", label = "Go Back"),
-            GestureActionEntity("SWIPE_RIGHT", "HOME", label = "Go Home"),
-            GestureActionEntity("SWIPE_LEFT_AND_HOLD", "RECENTS", label = "Open Recents Overview"),
-            GestureActionEntity("SWIPE_RIGHT_AND_HOLD", "NOTIFICATIONS", label = "Open Notifications Shade")
+            GestureActionEntity("SINGLE_TAP", "NONE", label = "Disabled (No Action)"),
+            GestureActionEntity("DOUBLE_TAP", "NONE", label = "Disabled (No Action)"),
+            GestureActionEntity("TRIPLE_TAP", "NONE", label = "Disabled (No Action)"),
+            GestureActionEntity("LONG_PRESS", "NONE", label = "Disabled (No Action)"),
+            GestureActionEntity("SWIPE_LEFT", "NONE", label = "Disabled (No Action)"),
+            GestureActionEntity("SWIPE_RIGHT", "NONE", label = "Disabled (No Action)"),
+            GestureActionEntity("SWIPE_LEFT_AND_HOLD", "NONE", label = "Disabled (No Action)"),
+            GestureActionEntity("SWIPE_RIGHT_AND_HOLD", "NONE", label = "Disabled (No Action)")
         )
     }
 }

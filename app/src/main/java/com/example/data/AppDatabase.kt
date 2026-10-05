@@ -15,9 +15,11 @@ import androidx.room.RoomDatabase
         DetectedCodeEntity::class,
         TextAssistantConfigEntity::class,
         TextSnippetEntity::class,
-        WallpaperConfigEntity::class
+        WallpaperConfigEntity::class,
+        AutoClickConfigEntity::class,
+        AutoClickPointEntity::class
     ],
-    version = 16,
+    version = 23,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -28,6 +30,7 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun codeDetectionDao(): CodeDetectionDao
     abstract fun textAssistantDao(): TextAssistantDao
     abstract fun wallpaperConfigDao(): WallpaperConfigDao
+    abstract fun autoClickDao(): AutoClickDao
 
     companion object {
         @Volatile

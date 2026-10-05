@@ -11,6 +11,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -46,38 +47,46 @@ fun DeveloperTab(
 ) {
     val context = LocalContext.current
 
-    val devLinks = listOf(
-        DevLink(
-            title = "GitHub Profile",
-            subtitle = "@shubhendu-rgb",
-            url = "https://github.com/shubhendu-rgb",
-            icon = Icons.Default.Code
-        ),
-        DevLink(
-            title = "Sk-Player Repository",
-            subtitle = "github.com/shubhendu-rgb/Sk-Player",
-            url = "https://github.com/shubhendu-rgb/Sk-Player",
-            icon = Icons.Default.PlayCircle
-        ),
-        DevLink(
-            title = "Report Issue / Feedback",
-            subtitle = "Submit bugs or feature requests",
-            url = "https://github.com/shubhendu-rgb/Sk-Player/issues",
-            icon = Icons.Default.BugReport
-        ),
-        DevLink(
-            title = "Email Support",
-            subtitle = "Direct contact for queries",
-            url = "mailto:skyhelp12by7@gmail.com",
-            icon = Icons.Default.Mail
-        ),
-        DevLink(
-            title = "Instagram",
-            subtitle = "Follow on Instagram",
-            url = "https://www.instagram.com/p/DcgbF4ASYmQ/?stkn=MzRlODBiNWFlZA==",
-            icon = Icons.Default.CameraAlt
+    val devLinks = remember {
+        listOf(
+            DevLink(
+                title = "GitHub Profile",
+                subtitle = "@shubhendu-rgb",
+                url = "https://github.com/shubhendu-rgb",
+                icon = Icons.Default.Code
+            ),
+            DevLink(
+                title = "Sk-Player Repository",
+                subtitle = "github.com/shubhendu-rgb/Sk-Player",
+                url = "https://github.com/shubhendu-rgb/Sk-Player",
+                icon = Icons.Default.PlayCircle
+            ),
+            DevLink(
+                title = "SkY-Touch Repository",
+                subtitle = "github.com/shubhendu-rgb/SkY-Touch",
+                url = "https://github.com/shubhendu-rgb/SkY-Touch",
+                icon = Icons.Default.TouchApp
+            ),
+            DevLink(
+                title = "Report Issue / Feedback",
+                subtitle = "Submit bugs or feature requests",
+                url = "https://github.com/shubhendu-rgb/Sk-Player/issues",
+                icon = Icons.Default.BugReport
+            ),
+            DevLink(
+                title = "Email Support",
+                subtitle = "Direct contact for queries",
+                url = "mailto:skyhelp12by7@gmail.com",
+                icon = Icons.Default.Mail
+            ),
+            DevLink(
+                title = "Instagram",
+                subtitle = "Follow on Instagram",
+                url = "https://www.instagram.com/p/DcgbF4ASYmQ/?stkn=MzRlODBiNWFlZA==",
+                icon = Icons.Default.CameraAlt
+            )
         )
-    )
+    }
 
     LazyColumn(
         modifier = modifier
@@ -131,18 +140,35 @@ fun DeveloperTab(
                         color = MaterialTheme.colorScheme.onSurface
                     )
 
-                    Surface(
-                        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.6f),
-                        shape = RoundedCornerShape(8.dp),
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
                         modifier = Modifier.padding(top = 4.dp)
                     ) {
-                        Text(
-                            text = "Android & System UI Developer",
-                            color = MaterialTheme.colorScheme.primary,
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
-                        )
+                        Surface(
+                            color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.6f),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text(
+                                text = "Android & System UI Developer",
+                                color = MaterialTheme.colorScheme.primary,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                            )
+                        }
+                        Surface(
+                            color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.7f),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text(
+                                text = "v8.1",
+                                color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                            )
+                        }
                     }
 
                     Spacer(modifier = Modifier.height(14.dp))
@@ -206,8 +232,7 @@ fun DeveloperTab(
         }
 
         // Links List
-        items(devLinks.size) { index ->
-            val link = devLinks[index]
+        items(devLinks, key = { it.url }) { link ->
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -274,7 +299,7 @@ fun DeveloperTab(
                 contentAlignment = Alignment.Center
             ) {
                 Text(
-                    text = "SkY Touch • Built with Jetpack Compose",
+                    text = "SkY Touch v8.1 • Built with Jetpack Compose",
                     fontSize = 11.sp,
                     color = MaterialTheme.colorScheme.outline
                 )

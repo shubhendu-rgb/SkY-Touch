@@ -38,7 +38,7 @@ class GreetingScreenshotTest {
             .padding(16.dp),
           contentAlignment = Alignment.Center
         ) {
-          AppHeader(isServiceActive = true, onOpenSettings = {})
+          AppHeader(isServiceRunning = true, isPermissionEnabled = true, onOpenSettings = {})
         }
       }
     }

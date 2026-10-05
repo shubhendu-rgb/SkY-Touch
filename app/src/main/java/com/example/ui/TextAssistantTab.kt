@@ -3,11 +3,19 @@ package com.example.ui
 import android.content.Context
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -18,14 +26,18 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
+import androidx.compose.material3.ripple
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -41,6 +53,20 @@ import com.example.service.NotchAccessibilityService
 import com.example.util.GeminiTextHelper
 import kotlinx.coroutines.launch
 
+data class BuiltInTriggerItem(
+    val keyword: String,
+    val description: String
+)
+
+val defaultBuiltInTriggers = listOf(
+    BuiltInTriggerItem("replace", "Replace text with clipboard content."),
+    BuiltInTriggerItem("paste", "Paste from clipboard."),
+    BuiltInTriggerItem("undo", "Undo the last replacement and restore the original text."),
+    BuiltInTriggerItem("copy", "Copy the text to clipboard."),
+    BuiltInTriggerItem("cut", "Cut the text to clipboard."),
+    BuiltInTriggerItem("translate:xx", "Translate text to any language code (e.g. ?translate:es, ?translate:fr).")
+)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TextAssistantTab(
@@ -52,6 +78,7 @@ fun TextAssistantTab(
     val config = uiState.textAssistantConfig
     val snippets = uiState.textSnippets
     val context = LocalContext.current
+    val uriHandler = LocalUriHandler.current
     val coroutineScope = rememberCoroutineScope()
 
     // Dialog state
@@ -59,6 +86,8 @@ fun TextAssistantTab(
     var showNewSnippetDialog by remember { mutableStateOf(false) }
     var newSnippetIsAi by remember { mutableStateOf(false) }
     var showResetConfirmation by remember { mutableStateOf(false) }
+    var snippetToDelete by remember { mutableStateOf<TextSnippetEntity?>(null) }
+    var selectedCategory by remember { mutableStateOf("ai") }
 
     // API Key test state
     var isTestingApiKey by remember { mutableStateOf(false) }
@@ -77,7 +106,7 @@ fun TextAssistantTab(
         modifier = modifier
             .fillMaxSize()
             .testTag("text_assistant_tab"),
-        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 100.dp),
+        contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 16.dp, bottom = 100.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         // Hero Header & Master Toggle
@@ -456,9 +485,9 @@ fun TextAssistantTab(
                             apiKeyInput = it
                         },
                         label = { Text("Gemini API Key") },
-                        placeholder = { Text("Paste your API key (AIzaSy...)") },
+                        placeholder = { Text("Paste your API key (starts with AIzaSy...)") },
                         supportingText = {
-                            Text("Get your free API key at https://aistudio.google.com/")
+                            Text("Starts with 'AIzaSy...'. Note: Do NOT use an OAuth Client ID.")
                         },
                         singleLine = true,
                         trailingIcon = {
@@ -491,19 +520,34 @@ fun TextAssistantTab(
                         shape = RoundedCornerShape(24.dp)
                     )
 
+                    // One-click Get API Key Button
+                    OutlinedButton(
+                        onClick = {
+                            try {
+                                uriHandler.openUri("https://aistudio.google.com/apikey")
+                            } catch (_: Exception) {}
+                        },
+                        shape = RoundedCornerShape(20.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.OpenInNew,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Get Free Gemini API Key (Google AI Studio)")
+                    }
+
                     // Model Selection Dropdown
                     var expandedModelDropdown by remember { mutableStateOf(false) }
                     val availableModels = listOf(
-                        "gemini-3.5-flash",
-                        "gemini-3.1-pro-preview",
                         "gemini-2.5-flash",
+                        "gemini-flash-latest",
+                        "gemini-3.5-flash",
                         "gemini-2.5-pro",
-                        "gemini-2.0-flash",
-                        "gemini-2.0-flash-lite-preview-02-05",
-                        "gemini-2.0-pro-exp-02-05",
-                        "gemini-2.0-flash-thinking-exp-01-21",
-                        "gemini-1.5-flash",
-                        "gemini-1.5-pro"
+                        "gemini-3.1-pro-preview",
+                        "gemini-3.1-flash-lite-preview"
                     )
 
                     ExposedDropdownMenuBox(
@@ -540,24 +584,33 @@ fun TextAssistantTab(
                     }
 
                     // Test API Key Button
-                    OutlinedButton(
+                    val keyToTest = apiKeyInput.trim().ifEmpty { effectiveKey }
+                    val canTestKey = keyToTest.isNotBlank()
+
+                    Button(
                         onClick = {
                             isTestingApiKey = true
                             apiKeyTestResult = null
                             apiKeyTestSuccess = null
+
+                            // Save current text input immediately
+                            if (apiKeyInput.isNotBlank()) {
+                                viewModel.updateTextAssistantConfig(config.copy(apiKey = apiKeyInput.trim()))
+                            }
+
                             coroutineScope.launch {
-                                val result = GeminiTextHelper.testApiKey(effectiveKey, config.modelName)
+                                val result = GeminiTextHelper.testApiKey(keyToTest, config.modelName, context)
                                 isTestingApiKey = false
                                 result.onSuccess {
                                     apiKeyTestSuccess = true
                                     apiKeyTestResult = it
                                 }.onFailure { error ->
                                     apiKeyTestSuccess = false
-                                    apiKeyTestResult = error.localizedMessage ?: "Unknown error"
+                                    apiKeyTestResult = error.localizedMessage ?: "Unknown error occurred"
                                 }
                             }
                         },
-                        enabled = !isTestingApiKey && effectiveKey.isNotBlank(),
+                        enabled = !isTestingApiKey && canTestKey,
                         shape = RoundedCornerShape(24.dp),
                         modifier = Modifier
                             .fillMaxWidth()
@@ -566,10 +619,11 @@ fun TextAssistantTab(
                         if (isTestingApiKey) {
                             CircularProgressIndicator(
                                 modifier = Modifier.size(16.dp),
+                                color = MaterialTheme.colorScheme.onPrimary,
                                 strokeWidth = 2.dp
                             )
                             Spacer(modifier = Modifier.width(8.dp))
-                            Text("Testing...")
+                            Text("Testing Gemini Connection...")
                         } else {
                             Icon(
                                 imageVector = Icons.Filled.Speed,
@@ -584,28 +638,59 @@ fun TextAssistantTab(
                     // Test result display
                     apiKeyTestResult?.let { msg ->
                         Surface(
-                            shape = RoundedCornerShape(8.dp),
+                            shape = RoundedCornerShape(16.dp),
                             color = if (apiKeyTestSuccess == true)
-                                MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f)
+                                MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.6f)
                             else
-                                MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.5f)
+                                MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.7f),
+                            border = BorderStroke(
+                                1.dp,
+                                if (apiKeyTestSuccess == true) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
+                            )
                         ) {
-                            Row(
-                                modifier = Modifier.padding(10.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(14.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
-                                Icon(
-                                    imageVector = if (apiKeyTestSuccess == true) Icons.Filled.Check else Icons.Filled.Error,
-                                    contentDescription = null,
-                                    tint = if (apiKeyTestSuccess == true) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
-                                    modifier = Modifier.size(18.dp)
-                                )
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = if (apiKeyTestSuccess == true) Icons.Filled.CheckCircle else Icons.Filled.Error,
+                                        contentDescription = null,
+                                        tint = if (apiKeyTestSuccess == true) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                    Text(
+                                        text = if (apiKeyTestSuccess == true) "Connection Successful" else "Authentication / Connection Error",
+                                        style = MaterialTheme.typography.titleSmall,
+                                        fontWeight = FontWeight.Bold,
+                                        color = if (apiKeyTestSuccess == true) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onErrorContainer
+                                    )
+                                }
                                 Text(
                                     text = msg,
                                     style = MaterialTheme.typography.bodySmall,
                                     color = if (apiKeyTestSuccess == true) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onErrorContainer
                                 )
+                                if (apiKeyTestSuccess == false) {
+                                    FilledTonalButton(
+                                        onClick = {
+                                            try {
+                                                uriHandler.openUri("https://aistudio.google.com/apikey")
+                                            } catch (_: Exception) {}
+                                        },
+                                        shape = RoundedCornerShape(16.dp),
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Icon(Icons.Filled.Key, contentDescription = null, modifier = Modifier.size(16.dp))
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text("Open Google AI Studio to Get API Key")
+                                    }
+                                }
                             }
                         }
                     }
@@ -613,158 +698,134 @@ fun TextAssistantTab(
             }
         }
 
-        // Local Instant Text Expansion Snippets
+        // Category Filter & Add Trigger Header
         item {
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .testTag("local_snippets_card"),
-                shape = RoundedCornerShape(24.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                Column(
-                    modifier = Modifier.padding(20.dp),
-                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Filled.Bolt,
-                                contentDescription = "Local Snippets",
-                                tint = MaterialTheme.colorScheme.primary,
-                                modifier = Modifier.size(24.dp)
-                            )
-                            Column {
-                                Text(
-                                    text = "Instant Text Snippets",
-                                    style = MaterialTheme.typography.titleMedium,
-                                    fontWeight = FontWeight.Bold
-                                )
-                                Text(
-                                    text = "${localSnippets.count { it.isEnabled }} active (${localSnippets.size} total)",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                        }
-
-                        FilledTonalIconButton(
-                            onClick = {
-                                newSnippetIsAi = false
-                                showNewSnippetDialog = true
-                            },
-                            modifier = Modifier.testTag("add_local_snippet_button")
-                        ) {
-                            Icon(Icons.Filled.Add, contentDescription = "New Snippet", modifier = Modifier.size(16.dp))
-                        }
-                    }
-
-                    if (localSnippets.isEmpty()) {
+                    Column {
                         Text(
-                            text = "No local snippets defined. Tap 'New Snippet' to add your first quick shortcut.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(vertical = 8.dp)
+                            text = when (selectedCategory) {
+                                "ai" -> "AI Triggers"
+                                "builtin" -> "Built-in Triggers"
+                                "local" -> "Text Shortcuts"
+                                else -> "All Triggers & Actions"
+                            },
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold
                         )
-                    } else {
-                        localSnippets.forEach { snippet ->
-                            SnippetRowItem(
-                                snippet = snippet,
-                                prefix = config.triggerPrefix,
-                                onToggle = { isEnabled ->
-                                    viewModel.updateSnippet(snippet.copy(isEnabled = isEnabled))
-                                },
-                                onEdit = { showEditSnippetDialog = snippet },
-                                onDelete = { viewModel.deleteSnippet(snippet.id) }
-                            )
-                        }
+                        Text(
+                            text = "Type ${config.triggerPrefix}<keyword> at the end of any text",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     }
+
+                    FilledTonalButton(
+                        onClick = {
+                            newSnippetIsAi = (selectedCategory != "local")
+                            showNewSnippetDialog = true
+                        },
+                        shape = RoundedCornerShape(16.dp),
+                        modifier = Modifier.testTag("add_trigger_button")
+                    ) {
+                        Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Add")
+                    }
+                }
+
+                // Category Filter Chips
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    FilterChip(
+                        selected = selectedCategory == "ai",
+                        onClick = { selectedCategory = "ai" },
+                        label = { Text("AI Triggers (${aiSnippets.size})") },
+                        shape = RoundedCornerShape(12.dp)
+                    )
+                    FilterChip(
+                        selected = selectedCategory == "builtin",
+                        onClick = { selectedCategory = "builtin" },
+                        label = { Text("Built-in (${defaultBuiltInTriggers.size})") },
+                        shape = RoundedCornerShape(12.dp)
+                    )
+                    FilterChip(
+                        selected = selectedCategory == "local",
+                        onClick = { selectedCategory = "local" },
+                        label = { Text("Shortcuts (${localSnippets.size})") },
+                        shape = RoundedCornerShape(12.dp)
+                    )
+                    FilterChip(
+                        selected = selectedCategory == "all",
+                        onClick = { selectedCategory = "all" },
+                        label = { Text("All") },
+                        shape = RoundedCornerShape(12.dp)
+                    )
                 }
             }
         }
 
-        // AI Smart Transformation Actions
-        item {
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .testTag("ai_snippets_card"),
-                shape = RoundedCornerShape(24.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
-            ) {
-                Column(
-                    modifier = Modifier.padding(20.dp),
-                    verticalArrangement = Arrangement.spacedBy(14.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Filled.AutoAwesome,
-                                contentDescription = "AI Actions",
-                                tint = MaterialTheme.colorScheme.primary,
-                                modifier = Modifier.size(24.dp)
-                            )
-                            Column {
-                                Text(
-                                    text = "AI Smart Transformations",
-                                    style = MaterialTheme.typography.titleMedium,
-                                    fontWeight = FontWeight.Bold
-                                )
-                                Text(
-                                    text = "${aiSnippets.count { it.isEnabled }} active (${aiSnippets.size} total)",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                        }
+        // Render AI Triggers
+        if (selectedCategory == "ai" || selectedCategory == "all") {
+            if (aiSnippets.isEmpty()) {
+                item {
+                    Text(
+                        text = "No AI triggers found. Tap '+ Add' to create one or 'Reset Default Snippets' below.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(vertical = 12.dp)
+                    )
+                }
+            } else {
+                items(aiSnippets, key = { "ai_${it.id}" }) { snippet ->
+                    AiTriggerCard(
+                        snippet = snippet,
+                        prefix = config.triggerPrefix,
+                        onEdit = { showEditSnippetDialog = snippet },
+                        onDelete = { snippetToDelete = snippet }
+                    )
+                }
+            }
+        }
 
-                        FilledTonalIconButton(
-                            onClick = {
-                                newSnippetIsAi = true
-                                showNewSnippetDialog = true
-                            },
-                            modifier = Modifier.testTag("add_ai_snippet_button")
-                        ) {
-                            Icon(Icons.Filled.Add, contentDescription = "New AI Action", modifier = Modifier.size(16.dp))
-                        }
-                    }
+        // Render Built-in Triggers
+        if (selectedCategory == "builtin" || selectedCategory == "all") {
+            items(defaultBuiltInTriggers, key = { "builtin_${it.keyword}" }) { item ->
+                BuiltInTriggerCard(
+                    item = item,
+                    prefix = config.triggerPrefix
+                )
+            }
+        }
 
-                    if (aiSnippets.isEmpty()) {
-                        Text(
-                            text = "No AI actions defined. Tap 'New AI Action' to add prompts for fixing grammar, formal tone, summarizing, etc.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(vertical = 8.dp)
-                        )
-                    } else {
-                        aiSnippets.forEach { snippet ->
-                            SnippetRowItem(
-                                snippet = snippet,
-                                prefix = config.triggerPrefix,
-                                onToggle = { isEnabled ->
-                                    viewModel.updateSnippet(snippet.copy(isEnabled = isEnabled))
-                                },
-                                onEdit = { showEditSnippetDialog = snippet },
-                                onDelete = { viewModel.deleteSnippet(snippet.id) }
-                            )
-                        }
-                    }
+        // Render Local Shortcuts
+        if (selectedCategory == "local" || selectedCategory == "all") {
+            if (localSnippets.isEmpty()) {
+                item {
+                    Text(
+                        text = "No local shortcuts defined. Tap '+ Add' to create one.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(vertical = 12.dp)
+                    )
+                }
+            } else {
+                items(localSnippets, key = { "local_${it.id}" }) { snippet ->
+                    AiTriggerCard(
+                        snippet = snippet,
+                        prefix = config.triggerPrefix,
+                        onEdit = { showEditSnippetDialog = snippet },
+                        onDelete = { snippetToDelete = snippet }
+                    )
                 }
             }
         }
@@ -874,7 +935,7 @@ fun TextAssistantTab(
                 triggerKeyword = "",
                 isAiAction = newSnippetIsAi,
                 replacementText = "",
-                aiPromptInstruction = if (newSnippetIsAi) "Fix all spelling and grammar errors. Output ONLY the corrected text." else "",
+                aiPromptInstruction = "",
                 isEnabled = true
             ),
             prefix = config.triggerPrefix,
@@ -901,13 +962,40 @@ fun TextAssistantTab(
         )
     }
 
+    // Dialog for Delete Trigger Confirmation
+    snippetToDelete?.let { snippet ->
+        AlertDialog(
+            onDismissRequest = { snippetToDelete = null },
+            icon = { Icon(Icons.Filled.DeleteOutline, contentDescription = null, tint = Color(0xFFFF5252)) },
+            title = { Text("Delete Trigger?") },
+            text = { Text("Are you sure you want to delete '${config.triggerPrefix}${snippet.triggerKeyword}'?") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        viewModel.deleteSnippet(snippet.id)
+                        snippetToDelete = null
+                        Toast.makeText(context, "Trigger deleted", Toast.LENGTH_SHORT).show()
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF5252))
+                ) {
+                    Text("Delete")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { snippetToDelete = null }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
     // Confirmation for Resetting Defaults
     if (showResetConfirmation) {
         AlertDialog(
             onDismissRequest = { showResetConfirmation = false },
             icon = { Icon(Icons.Filled.Restore, contentDescription = null) },
             title = { Text("Reset Default Snippets?") },
-            text = { Text("This will replace your current snippets with the built-in default local shortcuts (?addr, ?email, ?meet, ?shrug) and AI actions (?fix, ?formal, ?shorten, ?reply, ?translate).") },
+            text = { Text("This will replace your current snippets with the default AI actions (?improve, ?shorten, ?expand, ?formal, ?casual, ?emoji, ?human, ?reply, ?fix) and local shortcuts (?addr, ?email, ?meet, ?shrug).") },
             confirmButton = {
                 Button(
                     onClick = {
@@ -929,109 +1017,215 @@ fun TextAssistantTab(
 }
 
 @Composable
-fun SnippetRowItem(
+fun AiTriggerCard(
     snippet: TextSnippetEntity,
     prefix: String,
-    onToggle: (Boolean) -> Unit,
     onEdit: () -> Unit,
     onDelete: () -> Unit
 ) {
     var isExpanded by remember { mutableStateOf(false) }
+    val rotationState by animateFloatAsState(
+        targetValue = if (isExpanded) 180f else 0f,
+        animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
+        label = "chevron_rotation"
+    )
 
-    Surface(
-        shape = RoundedCornerShape(24.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f)),
-        modifier = Modifier.fillMaxWidth().clickable { isExpanded = !isExpanded }
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("trigger_card_${snippet.triggerKeyword}")
+            .clip(RoundedCornerShape(18.dp))
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = ripple()
+            ) {
+                isExpanded = !isExpanded
+            },
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)
+        ),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.25f))
     ) {
-        Row(
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 14.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                .animateContentSize(
+                    animationSpec = spring(
+                        stiffness = Spring.StiffnessMediumLow,
+                        dampingRatio = Spring.DampingRatioNoBouncy
+                    )
+                )
+                .padding(horizontal = 18.dp, vertical = 16.dp)
         ) {
-            // Trigger Keyword Badge
-            Surface(
-                shape = RoundedCornerShape(8.dp),
-                color = if (snippet.isAiAction)
-                    MaterialTheme.colorScheme.primaryContainer
-                else
-                    MaterialTheme.colorScheme.secondaryContainer,
-                modifier = Modifier.widthIn(min = 64.dp)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text(
+                        text = "$prefix${snippet.triggerKeyword}",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Icon(
+                        imageVector = Icons.Filled.KeyboardArrowDown,
+                        contentDescription = if (isExpanded) "Collapse prompt" else "Expand prompt",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                        modifier = Modifier
+                            .size(20.dp)
+                            .graphicsLayer { rotationZ = rotationState }
+                    )
+                }
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Edit",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Normal,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier
+                            .clickable(
+                                interactionSource = remember { MutableInteractionSource() },
+                                indication = ripple(bounded = false, radius = 20.dp)
+                            ) { onEdit() }
+                            .padding(horizontal = 6.dp, vertical = 2.dp)
+                    )
+                    Text(
+                        text = "|",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.8f),
+                        modifier = Modifier.padding(horizontal = 2.dp)
+                    )
+                    Text(
+                        text = "Delete",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Normal,
+                        color = Color(0xFFFF5252),
+                        modifier = Modifier
+                            .clickable(
+                                interactionSource = remember { MutableInteractionSource() },
+                                indication = ripple(bounded = false, radius = 20.dp)
+                            ) { onDelete() }
+                            .padding(horizontal = 6.dp, vertical = 2.dp)
+                    )
+                }
+            }
+
+            AnimatedVisibility(
+                visible = isExpanded,
+                enter = fadeIn(tween(180)) + expandVertically(tween(220)),
+                exit = fadeOut(tween(150)) + shrinkVertically(tween(180))
+            ) {
+                Column {
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Text(
+                        text = if (snippet.isAiAction) snippet.aiPromptInstruction else snippet.replacementText,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        lineHeight = 22.sp
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun BuiltInTriggerCard(
+    item: BuiltInTriggerItem,
+    prefix: String
+) {
+    var isExpanded by remember { mutableStateOf(false) }
+    val rotationState by animateFloatAsState(
+        targetValue = if (isExpanded) 180f else 0f,
+        animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
+        label = "builtin_chevron_rotation"
+    )
+
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("builtin_trigger_card_${item.keyword}")
+            .clip(RoundedCornerShape(18.dp))
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = ripple()
+            ) {
+                isExpanded = !isExpanded
+            },
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)
+        ),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.25f))
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .animateContentSize(
+                    animationSpec = spring(
+                        stiffness = Spring.StiffnessMediumLow,
+                        dampingRatio = Spring.DampingRatioNoBouncy
+                    )
+                )
+                .padding(horizontal = 18.dp, vertical = 16.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text(
+                        text = "$prefix${item.keyword}",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Icon(
+                        imageVector = Icons.Filled.KeyboardArrowDown,
+                        contentDescription = if (isExpanded) "Collapse" else "Expand",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                        modifier = Modifier
+                            .size(20.dp)
+                            .graphicsLayer { rotationZ = rotationState }
+                    )
+                }
+
                 Text(
-                    text = "$prefix${snippet.triggerKeyword}",
-                    style = MaterialTheme.typography.labelLarge,
-                    fontWeight = FontWeight.Bold,
-                    fontFamily = FontFamily.Monospace,
-                    color = if (snippet.isAiAction)
-                        MaterialTheme.colorScheme.onPrimaryContainer
-                    else
-                        MaterialTheme.colorScheme.onSecondaryContainer,
-                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
+                    text = "Built-in",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f),
+                    modifier = Modifier.padding(vertical = 2.dp)
                 )
             }
 
-            // Description / Replacement preview
-            Column(modifier = Modifier.weight(1f)) {
-                if (!snippet.isAiAction) {
+            AnimatedVisibility(
+                visible = isExpanded,
+                enter = fadeIn(tween(180)) + expandVertically(tween(220)),
+                exit = fadeOut(tween(150)) + shrinkVertically(tween(180))
+            ) {
+                Column {
+                    Spacer(modifier = Modifier.height(12.dp))
                     Text(
-                        text = snippet.replacementText,
+                        text = item.description,
                         style = MaterialTheme.typography.bodyMedium,
-                        maxLines = if (isExpanded) Int.MAX_VALUE else 2,
-                        overflow = if (isExpanded) TextOverflow.Clip else TextOverflow.Ellipsis,
-                        color = if (snippet.isEnabled)
-                            MaterialTheme.colorScheme.onSurface
-                        else
-                            MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
-                    )
-                } else {
-                    Text(
-                        text = "AI Transformation",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = if (snippet.isEnabled)
-                            MaterialTheme.colorScheme.primary
-                        else
-                            MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        lineHeight = 22.sp
                     )
                 }
             }
-
-            if (isExpanded) {
-                // Edit button
-                IconButton(
-                    onClick = onEdit,
-                    modifier = Modifier.size(34.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Filled.Edit,
-                        contentDescription = "Edit",
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.size(18.dp)
-                    )
-                }
-
-                // Delete button
-                IconButton(
-                    onClick = onDelete,
-                    modifier = Modifier.size(34.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Filled.DeleteOutline,
-                        contentDescription = "Delete",
-                        tint = MaterialTheme.colorScheme.error.copy(alpha = 0.8f),
-                        modifier = Modifier.size(18.dp)
-                    )
-                }
-            }
-
-            // Toggle Switch
-            Switch(
-                checked = snippet.isEnabled,
-                onCheckedChange = onToggle,
-                modifier = Modifier.scale(0.85f)
-            )
         }
     }
 }
@@ -1050,24 +1244,14 @@ fun SnippetEditDialog(
     var aiInstruction by remember { mutableStateOf(initialSnippet.aiPromptInstruction) }
     var isEnabled by remember { mutableStateOf(initialSnippet.isEnabled) }
 
-    // Pre-made AI presets
-    val presets = listOf(
-        Pair("Fix Grammar", "Fix all spelling, grammar, punctuation, and capitalization errors while preserving original tone. Output ONLY the polished text."),
-        Pair("Professional Tone", "Rewrite this message into a polite, respectful, and professional business tone. Output ONLY the rewritten text."),
-        Pair("Shorten", "Condense and summarize this text to make it clear, concise, and punchy while retaining all key points. Output ONLY the shortened text."),
-        Pair("Smart Reply", "Generate a thoughtful, friendly, and helpful direct reply to this message. Output ONLY the response text."),
-        Pair("Translate", "Translate this text into fluent, natural English (or if already in English, translate to Spanish). Output ONLY the translation."),
-        Pair("Explain Like I'm 5", "Explain this concept in simple, friendly, easy-to-understand language. Output ONLY the explanation.")
-    )
-
     AlertDialog(
         onDismissRequest = onDismiss,
         title = {
             Text(
                 text = if (initialSnippet.id == 0L) {
-                    if (isAi) "Add AI Smart Action" else "Add Instant Snippet"
+                    if (isAi) "Add AI Trigger" else "Add Text Shortcut"
                 } else {
-                    if (isAi) "Edit AI Action" else "Edit Snippet"
+                    if (isAi) "Edit AI Trigger" else "Edit Shortcut"
                 },
                 fontWeight = FontWeight.Bold
             )
@@ -1086,17 +1270,17 @@ fun SnippetEditDialog(
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         FilterChip(
-                            selected = !isAi,
-                            onClick = { isAi = false },
-                            label = { Text("Instant Text Expansion") },
-                            leadingIcon = { Icon(Icons.Filled.Bolt, contentDescription = null, modifier = Modifier.size(16.dp)) },
+                            selected = isAi,
+                            onClick = { isAi = true },
+                            label = { Text("AI Trigger") },
+                            leadingIcon = { Icon(Icons.Filled.AutoAwesome, contentDescription = null, modifier = Modifier.size(16.dp)) },
                             modifier = Modifier.weight(1f)
                         )
                         FilterChip(
-                            selected = isAi,
-                            onClick = { isAi = true },
-                            label = { Text("AI Gemini Transform") },
-                            leadingIcon = { Icon(Icons.Filled.AutoAwesome, contentDescription = null, modifier = Modifier.size(16.dp)) },
+                            selected = !isAi,
+                            onClick = { isAi = false },
+                            label = { Text("Text Shortcut") },
+                            leadingIcon = { Icon(Icons.Filled.Bolt, contentDescription = null, modifier = Modifier.size(16.dp)) },
                             modifier = Modifier.weight(1f)
                         )
                     }
@@ -1107,7 +1291,6 @@ fun SnippetEditDialog(
                     value = keyword,
                     onValueChange = { keyword = it.replace(" ", "").lowercase() },
                     label = { Text("Trigger Keyword") },
-                    placeholder = { Text(if (isAi) "formal" else "addr") },
                     prefix = { Text(prefix, fontWeight = FontWeight.Bold) },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
@@ -1120,7 +1303,6 @@ fun SnippetEditDialog(
                         value = replacementText,
                         onValueChange = { replacementText = it },
                         label = { Text("Replacement Text") },
-                        placeholder = { Text("123 Main Street, New York, NY") },
                         minLines = 3,
                         maxLines = 6,
                         modifier = Modifier.fillMaxWidth(),
@@ -1132,43 +1314,11 @@ fun SnippetEditDialog(
                         value = aiInstruction,
                         onValueChange = { aiInstruction = it },
                         label = { Text("Gemini Prompt Instruction") },
-                        placeholder = { Text("Rewrite this into a polite business tone...") },
                         minLines = 3,
                         maxLines = 6,
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(24.dp)
                     )
-
-                    // Template Chips
-                    Text(
-                        text = "Quick Presets:",
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        presets.take(3).forEach { (name, prompt) ->
-                            SuggestionChip(
-                                onClick = { aiInstruction = prompt },
-                                label = { Text(name, fontSize = 11.sp) },
-                                shape = RoundedCornerShape(8.dp)
-                            )
-                        }
-                    }
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        presets.drop(3).forEach { (name, prompt) ->
-                            SuggestionChip(
-                                onClick = { aiInstruction = prompt },
-                                label = { Text(name, fontSize = 11.sp) },
-                                shape = RoundedCornerShape(8.dp)
-                            )
-                        }
-                    }
                 }
             }
         },

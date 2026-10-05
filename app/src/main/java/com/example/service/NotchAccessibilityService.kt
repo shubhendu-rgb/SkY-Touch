@@ -46,7 +46,10 @@ import android.widget.ScrollView
 import android.widget.ImageView
 import android.widget.TextView
 import android.widget.Toast
+import android.app.WallpaperManager
+import com.example.service.wallpaper.LiveWallpaperManager
 import com.example.data.AppDatabase
+import com.example.data.AutoClickConfigEntity
 import com.example.data.GestureActionEntity
 import com.example.data.NotchConfigEntity
 import com.example.data.NotchRepository
@@ -64,13 +67,41 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.IntentFilter
+import android.net.ConnectivityManager
 import android.os.SystemClock
 import android.widget.RemoteViews
 import androidx.core.app.NotificationCompat
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AirplanemodeActive
+import androidx.compose.material.icons.filled.AirplanemodeInactive
+import androidx.compose.material.icons.filled.BatteryAlert
+import androidx.compose.material.icons.filled.BatteryChargingFull
+import androidx.compose.material.icons.filled.Headphones
+import androidx.compose.material.icons.filled.PowerOff
+import androidx.compose.material.icons.filled.VolumeUp
+import androidx.compose.material.icons.filled.Wifi
+import androidx.compose.material.icons.filled.WifiOff
+import com.example.ui.island.CapsuleType
+import com.example.ui.island.DynamicNotchManager
+import com.example.ui.island.MiniCapsuleEvent
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.Job
+import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.platform.ViewCompositionStrategy
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.setViewTreeLifecycleOwner
+import androidx.lifecycle.setViewTreeViewModelStoreOwner
+import androidx.savedstate.setViewTreeSavedStateRegistryOwner
+import com.example.ui.island.DynamicIslandPill
+import com.example.ui.island.IslandState
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.height
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.delay
 import kotlin.math.abs
@@ -84,6 +115,8 @@ import android.os.Environment
 import android.os.StatFs
 import java.io.File
 import android.content.pm.PackageManager
+import android.service.quicksettings.TileService
+import android.content.ComponentName
 
 class NotchAccessibilityService : AccessibilityService() {
 
@@ -93,12 +126,61 @@ class NotchAccessibilityService : AccessibilityService() {
             private set
         var instance: NotchAccessibilityService? = null
             private set
+        val isAutoClickRunning: Boolean
+            get() = instance?.autoClickEngine?.isRunning?.value == true
+        var isAutoClickMenuVisible: Boolean = false
+            private set
+
+        val isSilentRecording: Boolean
+            get() = instance?.let { it.isRecordingBack || it.isRecordingFront } ?: false
+
+        val isRecordingBackActive: Boolean
+            get() = instance?.isRecordingBack == true
+
+        val isRecordingFrontActive: Boolean
+            get() = instance?.isRecordingFront == true
+
+        fun stopSilentRecording(context: Context? = null): Boolean {
+            val inst = instance
+            if (inst == null) {
+                context?.sendBroadcast(Intent("com.example.ACTION_STOP_RECORDING").apply {
+                    setPackage(context.packageName)
+                })
+                return false
+            }
+            var stopped = false
+            if (inst.isRecordingBack) {
+                inst.stopBackCameraRecord()
+                stopped = true
+            }
+            if (inst.isRecordingFront) {
+                inst.stopFrontCameraRecord()
+                stopped = true
+            }
+            updateStopRecordingTile(inst)
+            return stopped
+        }
+
+        fun updateStopRecordingTile(context: Context) {
+            try {
+                TileService.requestListeningState(
+                    context,
+                    ComponentName(context, com.example.service.tiles.StopRecordingTileService::class.java)
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to request tile listening state", e)
+            }
+        }
     }
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private lateinit var windowManager: WindowManager
     private var overlayContainer: FrameLayout? = null
     private var overlayView: View? = null
+    private var overlayLifecycleOwner: ServiceOverlayLifecycleOwner? = null
+
+    var autoClickEngine: com.example.service.AutoClickEngine? = null
+        private set
 
     // Side Deck state
     private var sideDeckConfig = SideDeckConfigEntity()
@@ -111,9 +193,19 @@ class NotchAccessibilityService : AccessibilityService() {
     private var isProcessingTextTransform = false
     private var lastReplacedText: String? = null
     private var lastReplacedTime: Long = 0L
+    private var previousTextBeforeReplacement: String? = null
 
     private var inlineSpinnerJob: Job? = null
     private val spinnerFrames = listOf("◐", "◓", "◑", "◒")
+
+    private lateinit var appPrefs: android.content.SharedPreferences
+    private var notchMasterEnabled = true
+    private val prefListener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { sharedPreferences, key ->
+        if (key == "notch_master_toggle") {
+            notchMasterEnabled = sharedPreferences.getBoolean("notch_master_toggle", true)
+            updateOverlayVisibility()
+        }
+    }
 
     private lateinit var repository: NotchRepository
     private var notchConfig = NotchConfigEntity()
@@ -157,8 +249,6 @@ class NotchAccessibilityService : AccessibilityService() {
 
     private var currentForegroundPackage: String? = null
 
-    private val RECORDING_NOTIFICATION_ID = 1001
-    private val RECORDING_CHANNEL_ID = "spy_cam_recording_channel"
     private val stopRecordingReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == "com.example.ACTION_STOP_RECORDING") {
@@ -168,27 +258,194 @@ class NotchAccessibilityService : AccessibilityService() {
         }
     }
 
+    private val capsuleSystemEventsReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent == null || context == null) return
+            try {
+                if (!DynamicNotchManager.isDynamicNotchEnabled.value) return
+                val behavior = DynamicNotchManager.activeBehavior.value
+                when (intent.action) {
+                    Intent.ACTION_POWER_CONNECTED -> {
+                        if (behavior.batteryChargingStarted) {
+                            DynamicNotchManager.postCapsuleEvent(
+                                MiniCapsuleEvent(
+                                    type = CapsuleType.BATTERY_CHARGING_STARTED,
+                                    title = "Charging",
+                                    subtitle = "Fast Charger Connected",
+                                    iconVector = Icons.Default.BatteryChargingFull,
+                                    accentColor = androidx.compose.ui.graphics.Color(0xFF00E676),
+                                    durationSeconds = behavior.collapseAfterSeconds
+                                )
+                            )
+                        }
+                    }
+                    Intent.ACTION_POWER_DISCONNECTED -> {
+                        if (behavior.batteryChargingStopped) {
+                            DynamicNotchManager.postCapsuleEvent(
+                                MiniCapsuleEvent(
+                                    type = CapsuleType.BATTERY_CHARGING_STOPPED,
+                                    title = "Unplugged",
+                                    subtitle = "Running on Battery",
+                                    iconVector = Icons.Default.PowerOff,
+                                    accentColor = androidx.compose.ui.graphics.Color(0xFFFFA000),
+                                    durationSeconds = behavior.collapseAfterSeconds
+                                )
+                            )
+                        }
+                    }
+                    Intent.ACTION_BATTERY_LOW -> {
+                        if (behavior.batteryLowWarning) {
+                            DynamicNotchManager.postCapsuleEvent(
+                                MiniCapsuleEvent(
+                                    type = CapsuleType.BATTERY_LOW,
+                                    title = "Battery Low",
+                                    subtitle = "Connect Charger Soon",
+                                    iconVector = Icons.Default.BatteryAlert,
+                                    accentColor = androidx.compose.ui.graphics.Color(0xFFFF3D00),
+                                    durationSeconds = behavior.collapseAfterSeconds
+                                )
+                            )
+                        }
+                    }
+                    Intent.ACTION_HEADSET_PLUG -> {
+                        val state = intent.getIntExtra("state", -1)
+                        if (state == 1 && behavior.headphonesConnected) {
+                            DynamicNotchManager.postCapsuleEvent(
+                                MiniCapsuleEvent(
+                                    type = CapsuleType.HEADPHONES_CONNECTED,
+                                    title = "Headphones",
+                                    subtitle = "Audio Connected",
+                                    iconVector = Icons.Default.Headphones,
+                                    accentColor = androidx.compose.ui.graphics.Color(0xFFA855F7),
+                                    durationSeconds = behavior.collapseAfterSeconds
+                                )
+                            )
+                        } else if (state == 0 && behavior.headphonesDisconnected) {
+                            DynamicNotchManager.postCapsuleEvent(
+                                MiniCapsuleEvent(
+                                    type = CapsuleType.HEADPHONES_DISCONNECTED,
+                                    title = "Headphones",
+                                    subtitle = "Disconnected",
+                                    iconVector = Icons.Default.Headphones,
+                                    accentColor = androidx.compose.ui.graphics.Color(0xFF94A3B8),
+                                    durationSeconds = behavior.collapseAfterSeconds
+                                )
+                            )
+                        }
+                    }
+                    Intent.ACTION_AIRPLANE_MODE_CHANGED -> {
+                        val isAirplane = intent.getBooleanExtra("state", false)
+                        if (isAirplane && behavior.airplaneModeOn) {
+                            DynamicNotchManager.postCapsuleEvent(
+                                MiniCapsuleEvent(
+                                    type = CapsuleType.AIRPLANE_ON,
+                                    title = "Airplane Mode",
+                                    subtitle = "Radios Disabled",
+                                    iconVector = Icons.Default.AirplanemodeActive,
+                                    accentColor = androidx.compose.ui.graphics.Color(0xFFF59E0B),
+                                    durationSeconds = behavior.collapseAfterSeconds
+                                )
+                            )
+                        } else if (!isAirplane && behavior.airplaneModeOff) {
+                            DynamicNotchManager.postCapsuleEvent(
+                                MiniCapsuleEvent(
+                                    type = CapsuleType.AIRPLANE_OFF,
+                                    title = "Airplane Mode Off",
+                                    subtitle = "Reconnecting Networks",
+                                    iconVector = Icons.Default.AirplanemodeInactive,
+                                    accentColor = androidx.compose.ui.graphics.Color(0xFF10B981),
+                                    durationSeconds = behavior.collapseAfterSeconds
+                                )
+                            )
+                        }
+                    }
+                    @Suppress("DEPRECATION")
+                    ConnectivityManager.CONNECTIVITY_ACTION -> {
+                        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                        @Suppress("DEPRECATION")
+                        val activeNet = cm?.activeNetworkInfo
+                        val isConnected = activeNet?.isConnected == true
+                        @Suppress("DEPRECATION")
+                        val isWifi = activeNet?.type == ConnectivityManager.TYPE_WIFI
+                        if (isConnected && isWifi && behavior.wifiConnected) {
+                            DynamicNotchManager.postCapsuleEvent(
+                                MiniCapsuleEvent(
+                                    type = CapsuleType.WIFI_CONNECTED,
+                                    title = "Wi-Fi Connected",
+                                    subtitle = "Online",
+                                    iconVector = Icons.Default.Wifi,
+                                    accentColor = androidx.compose.ui.graphics.Color(0xFF38BDF8),
+                                    durationSeconds = behavior.collapseAfterSeconds
+                                )
+                            )
+                        } else if (!isConnected && behavior.wifiDisconnected) {
+                            DynamicNotchManager.postCapsuleEvent(
+                                MiniCapsuleEvent(
+                                    type = CapsuleType.WIFI_DISCONNECTED,
+                                    title = "Wi-Fi Disconnected",
+                                    subtitle = "Offline",
+                                    iconVector = Icons.Default.WifiOff,
+                                    accentColor = androidx.compose.ui.graphics.Color(0xFFEF4444),
+                                    durationSeconds = behavior.collapseAfterSeconds
+                                )
+                            )
+                        }
+                    }
+                    AudioManager.RINGER_MODE_CHANGED_ACTION -> {
+                        if (behavior.volumeModeChanged) {
+                            val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+                            val ringerMode = am?.ringerMode ?: AudioManager.RINGER_MODE_NORMAL
+                            val subtitle = when (ringerMode) {
+                                AudioManager.RINGER_MODE_SILENT -> "Silent Mode"
+                                AudioManager.RINGER_MODE_VIBRATE -> "Vibrate Mode"
+                                else -> "Normal Sound"
+                            }
+                            DynamicNotchManager.postCapsuleEvent(
+                                MiniCapsuleEvent(
+                                    type = CapsuleType.VOLUME_CHANGED,
+                                    title = "Sound Mode",
+                                    subtitle = subtitle,
+                                    iconVector = Icons.Default.VolumeUp,
+                                    accentColor = androidx.compose.ui.graphics.Color(0xFF8B5CF6),
+                                    durationSeconds = behavior.collapseAfterSeconds
+                                )
+                            )
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+                // Ignore receiver error
+            }
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         val db = AppDatabase.getDatabase(this)
         repository = NotchRepository(db)
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                RECORDING_CHANNEL_ID,
-                "Spy Cam Recording",
-                NotificationManager.IMPORTANCE_LOW
-            )
-            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            manager.createNotificationChannel(channel)
-        }
         
         val filter = IntentFilter("com.example.ACTION_STOP_RECORDING")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(stopRecordingReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
         } else {
             registerReceiver(stopRecordingReceiver, filter)
+        }
+
+        val capsuleFilter = IntentFilter().apply {
+            addAction(Intent.ACTION_POWER_CONNECTED)
+            addAction(Intent.ACTION_POWER_DISCONNECTED)
+            addAction(Intent.ACTION_BATTERY_LOW)
+            addAction(Intent.ACTION_HEADSET_PLUG)
+            addAction(Intent.ACTION_AIRPLANE_MODE_CHANGED)
+            @Suppress("DEPRECATION")
+            addAction(ConnectivityManager.CONNECTIVITY_ACTION)
+            addAction(AudioManager.RINGER_MODE_CHANGED_ACTION)
+        }
+        try {
+            registerReceiver(capsuleSystemEventsReceiver, capsuleFilter)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to register capsule receiver", e)
         }
     }
 
@@ -197,6 +454,12 @@ class NotchAccessibilityService : AccessibilityService() {
         isRunning = true
         instance = this
         Log.d(TAG, "Service Connected")
+        DynamicNotchManager.initialize(this)
+        autoClickEngine = com.example.service.AutoClickEngine(this, repository, serviceScope)
+
+        appPrefs = getSharedPreferences("app_prefs", android.content.Context.MODE_PRIVATE)
+        notchMasterEnabled = appPrefs.getBoolean("notch_master_toggle", true)
+        appPrefs.registerOnSharedPreferenceChangeListener(prefListener)
 
         serviceScope.launch {
             // Ensure repository has default configuration
@@ -243,6 +506,13 @@ class NotchAccessibilityService : AccessibilityService() {
                     textSnippets = snippets
                 }
             }
+
+            // Observe AutoClick config for menu visibility
+            launch {
+                repository.autoClickConfigFlow.collectLatest { config ->
+                    isAutoClickMenuVisible = config.isMenuVisible
+                }
+            }
         }
     }
 
@@ -255,8 +525,9 @@ class NotchAccessibilityService : AccessibilityService() {
         if (event == null) return
 
         event.packageName?.toString()?.let { pkg ->
-            if (pkg.isNotEmpty() && pkg != "android") {
+            if (pkg.isNotEmpty() && pkg != "android" && pkg != currentForegroundPackage) {
                 currentForegroundPackage = pkg
+                autoClickEngine?.onAppChanged(pkg)
                 updateOverlayVisibility()
             }
         }
@@ -272,9 +543,6 @@ class NotchAccessibilityService : AccessibilityService() {
                 if (textAssistantConfig.enabled && !isProcessingTextTransform) {
                     stopInlineSpinner()
                 }
-                updateOverlayVisibility()
-            }
-            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
                 updateOverlayVisibility()
             }
         }
@@ -334,6 +602,7 @@ class NotchAccessibilityService : AccessibilityService() {
 
                     if (!snippet.isAiAction) {
                         // Local instant snippet replacement
+                        previousTextBeforeReplacement = precedingText
                         val replacement = snippet.replacementText
                         val newText = if (precedingText.isNotEmpty()) {
                             "$precedingText $replacement"
@@ -353,6 +622,7 @@ class NotchAccessibilityService : AccessibilityService() {
                     } else {
                         // AI LLM text transformation (Gemini)
                         val inputTextToRefine = precedingText.trim()
+                        previousTextBeforeReplacement = precedingText
 
                         isProcessingTextTransform = true
                         softHapticPulse(isCompletion = false)
@@ -367,7 +637,8 @@ class NotchAccessibilityService : AccessibilityService() {
                                 apiKey = textAssistantConfig.apiKey,
                                 modelName = textAssistantConfig.modelName,
                                 inputText = inputTextToRefine,
-                                instruction = snippet.aiPromptInstruction
+                                instruction = snippet.aiPromptInstruction,
+                                context = this@NotchAccessibilityService
                             )
 
                             withContext(Dispatchers.Main) {
@@ -469,7 +740,8 @@ class NotchAccessibilityService : AccessibilityService() {
                     apiKey = textAssistantConfig.apiKey,
                     modelName = textAssistantConfig.modelName,
                     inputText = inputTextToRefine,
-                    instruction = instruction
+                    instruction = instruction,
+                    context = this@NotchAccessibilityService
                 )
 
                 withContext(Dispatchers.Main) {
@@ -499,7 +771,49 @@ class NotchAccessibilityService : AccessibilityService() {
     }
 
     private fun handleEditingCommands(text: String, prefix: String, sourceNode: AccessibilityNodeInfo): Boolean {
-        val commandRegex = Regex("${Pattern.quote(prefix)}(copy|c|paste|v|cut|x|all|select|sel|clear|cls)[\\s,.:;!?\\n\\t]*$", RegexOption.IGNORE_CASE)
+        // Check for ?translate:xx first (e.g. ?translate:es, ?translate:fr, ?translate:de, ?translate:en)
+        val translateRegex = Regex("${Pattern.quote(prefix)}translate:([a-zA-Z]{2,5})[\\s,.:;!?\\n\\t]*$", RegexOption.IGNORE_CASE)
+        val translateMatch = translateRegex.find(text)
+        if (translateMatch != null) {
+            val langCode = translateMatch.groupValues[1].lowercase()
+            val precedingText = text.substring(0, translateMatch.range.first).trim()
+            if (precedingText.isNotEmpty()) {
+                isProcessingTextTransform = true
+                previousTextBeforeReplacement = precedingText
+                softHapticPulse(isCompletion = false)
+                startInlineSpinner(precedingText, sourceNode)
+                sourceNode.recycle()
+
+                serviceScope.launch {
+                    val result = GeminiTextHelper.transformText(
+                        apiKey = textAssistantConfig.apiKey,
+                        modelName = textAssistantConfig.modelName,
+                        inputText = precedingText,
+                        instruction = "Translate this text accurately into language code '$langCode'. Output ONLY the translated text without quotes or explanations.",
+                        context = this@NotchAccessibilityService
+                    )
+                    withContext(Dispatchers.Main) {
+                        stopInlineSpinner()
+                        result.onSuccess { translated ->
+                            lastReplacedText = translated
+                            lastReplacedTime = System.currentTimeMillis()
+                            val target = findActiveEditableNode()
+                            replaceTextInTargetNode(target, translated)
+                            softHapticPulse(isCompletion = true)
+                            target?.recycle()
+                        }.onFailure {
+                            val target = findActiveEditableNode()
+                            replaceTextInTargetNode(target, precedingText)
+                            target?.recycle()
+                        }
+                        handler.postDelayed({ isProcessingTextTransform = false }, 500L)
+                    }
+                }
+                return true
+            }
+        }
+
+        val commandRegex = Regex("${Pattern.quote(prefix)}(replace|undo|copy|c|paste|v|cut|x|all|select|sel|clear|cls)[\\s,.:;!?\\n\\t]*$", RegexOption.IGNORE_CASE)
         val matchResult = commandRegex.find(text) ?: return false
 
         val command = matchResult.groupValues[1].lowercase()
@@ -514,6 +828,21 @@ class NotchAccessibilityService : AccessibilityService() {
         val hasSelection = selStart >= 0 && selEnd >= 0 && selStart != selEnd
 
         when (command) {
+            "replace" -> {
+                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                val clipText = clipboard.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString() ?: ""
+                if (clipText.isNotEmpty()) {
+                    previousTextBeforeReplacement = precedingText
+                    replaceTextInTargetNode(sourceNode, clipText)
+                }
+            }
+            "undo" -> {
+                val toRestore = previousTextBeforeReplacement
+                if (!toRestore.isNullOrEmpty()) {
+                    previousTextBeforeReplacement = precedingText
+                    replaceTextInTargetNode(sourceNode, toRestore)
+                }
+            }
             "copy", "c" -> {
                 if (hasSelection) {
                     sourceNode.performAction(AccessibilityNodeInfo.ACTION_COPY)
@@ -524,7 +853,14 @@ class NotchAccessibilityService : AccessibilityService() {
                 }
             }
             "paste", "v" -> {
-                sourceNode.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                val clipText = clipboard.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString() ?: ""
+                if (clipText.isNotEmpty()) {
+                    val newText = if (precedingText.isNotEmpty()) "$precedingText $clipText" else clipText
+                    replaceTextInTargetNode(sourceNode, newText)
+                } else {
+                    sourceNode.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+                }
             }
             "cut", "x" -> {
                 if (hasSelection) {
@@ -737,9 +1073,16 @@ class NotchAccessibilityService : AccessibilityService() {
         if (instance == this) {
             instance = null
         }
+        
+        if (::appPrefs.isInitialized) {
+            appPrefs.unregisterOnSharedPreferenceChangeListener(prefListener)
+        }
+
         stopContinuousHoldAction()
         stopInlineSpinner()
         handler.removeCallbacksAndMessages(null)
+        autoClickEngine?.destroy()
+        autoClickEngine = null
         removeOverlay()
         removeSideDeckHandle()
         removeSideDeckPanel()
@@ -749,6 +1092,10 @@ class NotchAccessibilityService : AccessibilityService() {
         } catch (e: Exception) {
             Log.e(TAG, "Error unregistering receiver", e)
         }
+
+        try {
+            unregisterReceiver(capsuleSystemEventsReceiver)
+        } catch (_: Exception) {}
 
         // Release recorders & cameras
         try { stopBackCameraRecord() } catch (_: Exception) {}
@@ -767,227 +1114,322 @@ class NotchAccessibilityService : AccessibilityService() {
                 Log.e(TAG, "Error removing overlay", e)
             }
         }
+        overlayLifecycleOwner?.let { owner ->
+            owner.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
+            owner.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
+            owner.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
+        }
+        overlayLifecycleOwner = null
         overlayContainer = null
         overlayView = null
     }
 
+    fun notifyDynamicNotchChanged() {
+        handler.post {
+            updateOverlay()
+        }
+    }
+
     private fun updateOverlay() {
+        val isDynamicNotch = DynamicNotchManager.isDynamicNotchEnabled.value
+        val behavior = DynamicNotchManager.activeBehavior.value
         val density = resources.displayMetrics.density
-        val widthPx = (notchConfig.widthDp * density).toInt()
-        val heightPx = (notchConfig.heightDp * density).toInt()
+        val widthPx = (notchConfig.widthDp * density).toInt().coerceAtLeast(60)
+        val heightPx = (notchConfig.heightDp * density).toInt().coerceAtLeast(24)
         val xOffsetPx = (notchConfig.xOffsetDp * density).toInt()
         val yOffsetPx = (notchConfig.yOffsetDp * density).toInt()
 
-        val container = overlayContainer
-        val innerView = overlayView
-
-        // Generate drawable styling
-        val drawable = GradientDrawable().apply {
-            shape = when (notchConfig.shapeType.lowercase()) {
-                "circle" -> GradientDrawable.OVAL
-                else -> GradientDrawable.RECTANGLE
-            }
-            if (notchConfig.shapeType.lowercase() == "capsule") {
-                cornerRadius = (notchConfig.cornerRadiusDp * density)
-            } else if (notchConfig.shapeType.lowercase() == "rect") {
-                cornerRadius = 0f
-            }
-
-            if (notchConfig.showVisualOverlay) {
-                try {
-                    val baseColor = Color.parseColor(notchConfig.overlayColorHex)
-                    val alpha = (notchConfig.overlayOpacity * 255).toInt()
-                    setColor(Color.argb(alpha, Color.red(baseColor), Color.green(baseColor), Color.blue(baseColor)))
-                } catch (e: Exception) {
-                    setColor(Color.argb((notchConfig.overlayOpacity * 255).toInt(), 0, 0, 0))
-                }
+        // Calculate dynamic dimensions ensuring full touchable area
+        val activeCapsule = DynamicNotchManager.currentCapsuleEvent.value ?: DynamicNotchManager.liveActivityEvent.value
+        val effectiveWidthPx = if (isDynamicNotch) {
+            if (activeCapsule != null) {
+                (240 * density).toInt().coerceAtLeast(widthPx)
             } else {
-                setColor(Color.TRANSPARENT)
+                widthPx.coerceAtLeast((140 * density).toInt())
             }
+        } else {
+            widthPx
+        }
+        val effectiveHeightPx = if (isDynamicNotch) {
+            if (activeCapsule != null && activeCapsule.actionButtons.isNotEmpty()) {
+                (48 * density).toInt().coerceAtLeast(heightPx)
+            } else {
+                heightPx.coerceAtLeast((36 * density).toInt())
+            }
+        } else {
+            heightPx
         }
 
-        // If container and view already exist and attached, update in-place without tearing down
-        if (container != null && innerView != null) {
-            innerView.background = drawable
-            try {
-                val currentParams = container.layoutParams as? WindowManager.LayoutParams
-                if (currentParams != null) {
-                    currentParams.width = widthPx
-                    currentParams.height = heightPx
-                    currentParams.x = xOffsetPx
-                    currentParams.y = yOffsetPx
-                    windowManager.updateViewLayout(container, currentParams)
-                    return
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed in-place updateViewLayout, falling back to recreate", e)
-            }
-        }
-
-        // Fallback or Initial Create
+        // Remove previous overlay before re-attaching
         removeOverlay()
 
         val layoutParams = WindowManager.LayoutParams().apply {
-            width = widthPx
-            height = heightPx
+            width = effectiveWidthPx
+            height = effectiveHeightPx
             type = WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
-            flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+            var flagMask = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
                     WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
                     WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+            flags = flagMask
             format = PixelFormat.TRANSLUCENT
             gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
             x = xOffsetPx
             y = yOffsetPx
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                layoutInDisplayCutoutMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                } else {
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                }
+            }
         }
 
-        val newContainer = FrameLayout(this)
-        val newInnerView = View(this)
-        newInnerView.background = drawable
-        newContainer.addView(newInnerView, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        val newContainer = object : FrameLayout(this) {
+            init {
+                isClickable = true
+                isFocusable = false
+                clipChildren = false
+                clipToPadding = false
+            }
 
-        // Set touch listener
-        setupTouchListener(newInnerView)
+            override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+                if (isOverlayHidden) return false
+
+                // Process gesture touch event first so notch gestures always work even if dynamic notch is enabled
+                handleGestureTouchEvent(overlayView ?: this, ev)
+
+                // Also allow children (Compose action buttons) to receive touch events
+                try {
+                    super.dispatchTouchEvent(ev)
+                } catch (_: Exception) {}
+                return true
+            }
+        }
+
+        val lifecycleOwner = ServiceOverlayLifecycleOwner().apply {
+            performRestore(null)
+            handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
+            handleLifecycleEvent(Lifecycle.Event.ON_START)
+            handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
+        }
+        overlayLifecycleOwner = lifecycleOwner
+
+        // Set lifecycle and view tree owners on the root FrameLayout before children or WindowManager attach
+        newContainer.setViewTreeLifecycleOwner(lifecycleOwner)
+        newContainer.setViewTreeSavedStateRegistryOwner(lifecycleOwner)
+        newContainer.setViewTreeViewModelStoreOwner(lifecycleOwner)
+
+        val composeView = ComposeView(this).apply {
+            setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnDetachedFromWindow)
+            setViewTreeLifecycleOwner(lifecycleOwner)
+            setViewTreeSavedStateRegistryOwner(lifecycleOwner)
+            setViewTreeViewModelStoreOwner(lifecycleOwner)
+            setContent {
+                val isDynamic = DynamicNotchManager.isDynamicNotchEnabled.value
+                val skin = DynamicNotchManager.activeSkin.value
+                val currentBehavior = DynamicNotchManager.activeBehavior.value
+
+                if (isDynamic) {
+                    // Synchronize dimensions directly with calibrated notch position settings
+                    val alignedSkin = skin.copy(
+                        customWidthDp = notchConfig.widthDp,
+                        customHeightDp = notchConfig.heightDp,
+                        cornerRadiusDp = notchConfig.cornerRadiusDp
+                    )
+
+                    DynamicIslandPill(
+                        skin = alignedSkin,
+                        state = IslandState.COLLAPSED,
+                        behavior = currentBehavior,
+                        onStateChange = { /* Dynamic notch visual overlay is permanently unexpandable */ }
+                    )
+                } else {
+                    Box(
+                        modifier = Modifier
+                            .width(notchConfig.widthDp.dp)
+                            .height(notchConfig.heightDp.dp)
+                    )
+                }
+            }
+        }
+        newContainer.addView(
+            composeView,
+            FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER)
+        )
+        overlayView = composeView
 
         try {
             windowManager.addView(newContainer, layoutParams)
             overlayContainer = newContainer
-            overlayView = newInnerView
-            Log.d(TAG, "Overlay added successfully: w=$widthPx h=$heightPx y=$yOffsetPx")
+            Log.d(TAG, "Overlay added successfully: isDynamic=$isDynamicNotch w=$effectiveWidthPx h=$effectiveHeightPx y=$yOffsetPx")
             updateOverlayVisibility()
         } catch (e: Exception) {
             Log.e(TAG, "Failed to add overlay window", e)
         }
     }
 
-    private fun setupTouchListener(view: View) {
-        view.setOnTouchListener { _, event ->
-            if (isForegroundAppExcluded() || isCurrentWindowFullScreen()) {
-                return@setOnTouchListener false
+    private fun handleGestureTouchEvent(view: View, event: MotionEvent): Boolean {
+        if (isOverlayHidden) {
+            return false
+        }
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                startX = event.rawX
+                startY = event.rawY
+                isLongPressed = false
+                isSwipeHoldTriggered = false
+                currentSwipeHoldDirection = null
+                stopContinuousHoldAction()
+
+                // Visual touch scale bounce feedback
+                view.animate()
+                    .scaleX(1.10f)
+                    .scaleY(1.10f)
+                    .setDuration(120)
+                    .setInterpolator(OvershootInterpolator(1.2f))
+                    .start()
+
+                swipeHoldRunnable?.let { handler.removeCallbacks(it) }
+                swipeHoldRunnable = null
+
+                longPressRunnable?.let { handler.removeCallbacks(it) }
+                longPressRunnable = Runnable {
+                    isLongPressed = true
+                    vibrateFeedback()
+                    view.animate()
+                        .scaleX(1.20f)
+                        .scaleY(1.20f)
+                        .setDuration(100)
+                        .withEndAction {
+                            view.animate().scaleX(1.10f).scaleY(1.10f).setDuration(100).start()
+                        }
+                        .start()
+                    triggerGestureAction("LONG_PRESS")
+                }
+                handler.postDelayed(longPressRunnable!!, 500)
+                return true
             }
-            when (event.action) {
-                MotionEvent.ACTION_DOWN -> {
-                    startX = event.rawX
-                    startY = event.rawY
-                    isLongPressed = false
+            MotionEvent.ACTION_MOVE -> {
+                if (isSwipeHoldTriggered) return true
+
+                val deltaX = event.rawX - startX
+                val deltaY = event.rawY - startY
+
+                view.translationX = (deltaX * 0.35f).coerceIn(-45f, 45f)
+
+                if (abs(deltaX) > swipeThreshold || abs(deltaY) > swipeThreshold) {
+                    longPressRunnable?.let { handler.removeCallbacks(it) }
+
+                    if (abs(deltaX) > abs(deltaY) && abs(deltaX) > swipeThreshold) {
+                        val direction = if (deltaX > 0) "SWIPE_RIGHT_AND_HOLD" else "SWIPE_LEFT_AND_HOLD"
+                        if (currentSwipeHoldDirection != direction && !isSwipeHoldTriggered) {
+                            currentSwipeHoldDirection = direction
+                            swipeHoldRunnable?.let { handler.removeCallbacks(it) }
+                            swipeHoldRunnable = Runnable {
+                                isSwipeHoldTriggered = true
+                                view.animate().scaleX(1.20f).scaleY(1.20f).setDuration(120).start()
+                                triggerGestureAction(direction)
+                            }
+                            handler.postDelayed(swipeHoldRunnable!!, swipeHoldTimeout)
+                        }
+                    } else {
+                        if (!isSwipeHoldTriggered) {
+                            swipeHoldRunnable?.let { handler.removeCallbacks(it) }
+                            swipeHoldRunnable = null
+                            currentSwipeHoldDirection = null
+                        }
+                    }
+                }
+                return true
+            }
+            MotionEvent.ACTION_UP -> {
+                view.animate()
+                    .translationX(0f)
+                    .scaleX(1f)
+                    .scaleY(1f)
+                    .setDuration(220)
+                    .setInterpolator(DecelerateInterpolator(1.5f))
+                    .start()
+
+                stopContinuousHoldAction()
+                longPressRunnable?.let { handler.removeCallbacks(it) }
+                swipeHoldRunnable?.let { handler.removeCallbacks(it) }
+
+                if (isSwipeHoldTriggered) {
                     isSwipeHoldTriggered = false
                     currentSwipeHoldDirection = null
-                    stopContinuousHoldAction()
-
-                    // Cancel any previous swipe hold runnable
-                    swipeHoldRunnable?.let { handler.removeCallbacks(it) }
-                    swipeHoldRunnable = null
-
-                    // Schedule long press (triggers if finger stays stationary)
-                    longPressRunnable?.let { handler.removeCallbacks(it) }
-                    longPressRunnable = Runnable {
-                        isLongPressed = true
-                        vibrateFeedback()
-                        triggerGestureAction("LONG_PRESS")
-                    }
-                    handler.postDelayed(longPressRunnable!!, 500)
-                    true
-                }
-                MotionEvent.ACTION_MOVE -> {
-                    if (isSwipeHoldTriggered) return@setOnTouchListener true
-
+                } else if (!isLongPressed) {
                     val deltaX = event.rawX - startX
                     val deltaY = event.rawY - startY
 
-                    if (abs(deltaX) > swipeThreshold || abs(deltaY) > swipeThreshold) {
-                        // Finger moved significantly: cancel stationary long press
-                        longPressRunnable?.let { handler.removeCallbacks(it) }
-
-                        // Check horizontal swipe and hold
-                        if (abs(deltaX) > abs(deltaY) && abs(deltaX) > swipeThreshold) {
-                            val direction = if (deltaX > 0) "SWIPE_RIGHT_AND_HOLD" else "SWIPE_LEFT_AND_HOLD"
-                            if (currentSwipeHoldDirection != direction && !isSwipeHoldTriggered) {
-                                currentSwipeHoldDirection = direction
-                                swipeHoldRunnable?.let { handler.removeCallbacks(it) }
-                                swipeHoldRunnable = Runnable {
-                                    isSwipeHoldTriggered = true
-                                    triggerGestureAction(direction)
-                                }
-                                handler.postDelayed(swipeHoldRunnable!!, swipeHoldTimeout)
-                            }
+                    if (abs(deltaX) > swipeThreshold && abs(deltaX) > abs(deltaY)) {
+                        if (deltaX > 0) {
+                            triggerGestureAction("SWIPE_RIGHT")
                         } else {
-                            if (!isSwipeHoldTriggered) {
-                                swipeHoldRunnable?.let { handler.removeCallbacks(it) }
-                                swipeHoldRunnable = null
-                                currentSwipeHoldDirection = null
-                            }
+                            triggerGestureAction("SWIPE_LEFT")
                         }
-                    }
-                    true
-                }
-                MotionEvent.ACTION_UP -> {
-                    // Stop any continuous repeating action immediately when finger is lifted
-                    stopContinuousHoldAction()
+                    } else if (abs(deltaY) > swipeThreshold && abs(deltaY) > abs(deltaX)) {
+                        if (deltaY > 0) {
+                            triggerGestureAction("SWIPE_DOWN")
+                        } else {
+                            triggerGestureAction("SWIPE_UP")
+                        }
+                    } else if (abs(deltaX) <= swipeThreshold && abs(deltaY) <= swipeThreshold) {
+                        val currentTime = System.currentTimeMillis()
+                        if (currentTime - lastTapUpTime < multiTapTimeout) {
+                            tapCount++
+                        } else {
+                            tapCount = 1
+                        }
+                        lastTapUpTime = currentTime
 
-                    // Cancel scheduled long press and swipe-hold timers
-                    longPressRunnable?.let { handler.removeCallbacks(it) }
-                    swipeHoldRunnable?.let { handler.removeCallbacks(it) }
+                        pendingTapRunnable?.let { handler.removeCallbacks(it) }
 
-                    if (isSwipeHoldTriggered) {
-                        // Swipe-and-hold was already fired while holding
-                        isSwipeHoldTriggered = false
-                        currentSwipeHoldDirection = null
-                    } else if (!isLongPressed) {
-                        val deltaX = event.rawX - startX
-                        val deltaY = event.rawY - startY
-
-                        if (abs(deltaX) > swipeThreshold && abs(deltaX) > abs(deltaY)) {
-                            // Quick swipe release
-                            if (deltaX > 0) {
-                                triggerGestureAction("SWIPE_RIGHT")
-                            } else {
-                                triggerGestureAction("SWIPE_LEFT")
-                            }
-                        } else if (abs(deltaX) <= swipeThreshold && abs(deltaY) <= swipeThreshold) {
-                            // Tap handling with support for Single Tap, Double Tap, and Triple Tap
-                            val currentTime = System.currentTimeMillis()
-                            if (currentTime - lastTapUpTime < multiTapTimeout) {
-                                tapCount++
-                            } else {
-                                tapCount = 1
-                            }
-                            lastTapUpTime = currentTime
-
-                            pendingTapRunnable?.let { handler.removeCallbacks(it) }
-
-                            if (tapCount >= 3) {
-                                tapCount = 0
-                                pendingTapRunnable = null
-                                triggerGestureAction("TRIPLE_TAP")
-                            } else {
-                                val currentCount = tapCount
-                                pendingTapRunnable = Runnable {
-                                    if (currentCount == 2) {
-                                        triggerGestureAction("DOUBLE_TAP")
-                                    } else if (currentCount == 1) {
+                        if (tapCount >= 3) {
+                            tapCount = 0
+                            pendingTapRunnable = null
+                            triggerGestureAction("TRIPLE_TAP")
+                        } else {
+                            val currentCount = tapCount
+                            pendingTapRunnable = Runnable {
+                                if (currentCount == 2) {
+                                    triggerGestureAction("DOUBLE_TAP")
+                                } else if (currentCount == 1) {
+                                    val singleTapAction = gestureActions["SINGLE_TAP"]
+                                    if (singleTapAction != null && singleTapAction.actionType != "NONE") {
                                         triggerGestureAction("SINGLE_TAP")
                                     }
-                                    tapCount = 0
-                                    pendingTapRunnable = null
                                 }
-                                handler.postDelayed(pendingTapRunnable!!, multiTapTimeout)
+                                tapCount = 0
+                                pendingTapRunnable = null
                             }
+                            handler.postDelayed(pendingTapRunnable!!, multiTapTimeout)
                         }
                     }
-                    true
                 }
-                MotionEvent.ACTION_CANCEL -> {
-                    stopContinuousHoldAction()
-                    longPressRunnable?.let { handler.removeCallbacks(it) }
-                    swipeHoldRunnable?.let { handler.removeCallbacks(it) }
-                    pendingTapRunnable?.let { handler.removeCallbacks(it) }
-                    isSwipeHoldTriggered = false
-                    currentSwipeHoldDirection = null
-                    tapCount = 0
-                    true
-                }
-                else -> false
+                return true
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                view.animate()
+                    .translationX(0f)
+                    .scaleX(1f)
+                    .scaleY(1f)
+                    .setDuration(180)
+                    .setInterpolator(DecelerateInterpolator())
+                    .start()
+
+                stopContinuousHoldAction()
+                longPressRunnable?.let { handler.removeCallbacks(it) }
+                swipeHoldRunnable?.let { handler.removeCallbacks(it) }
+                pendingTapRunnable?.let { handler.removeCallbacks(it) }
+                isSwipeHoldTriggered = false
+                currentSwipeHoldDirection = null
+                tapCount = 0
+                return true
             }
         }
+        return false
     }
 
     private fun isContinuousAction(actionType: String): Boolean {
@@ -1085,7 +1527,63 @@ class NotchAccessibilityService : AccessibilityService() {
             "CUSTOM_BRIGHTNESS" -> setCustomBrightness(action.extraValue?.toIntOrNull() ?: 50)
             "LAUNCH_APP" -> launchApp(action.packageToLaunch)
             "SHORTCUT" -> launchShortcut(action)
+            "AUTOCLICK_TOGGLE" -> toggleAutoClick()
+            "AUTOCLICK_START" -> autoClickEngine?.start()
+            "AUTOCLICK_STOP" -> autoClickEngine?.stop()
+            "WALLPAPER_NEXT" -> cycleWallpaperAction("NEXT")
+            "WALLPAPER_PREVIOUS" -> cycleWallpaperAction("PREV")
+            "WALLPAPER_RANDOM" -> cycleWallpaperAction("RANDOM")
+            "WALLPAPER_HOME_NEXT" -> cycleWallpaperAction("NEXT", screenType = "HOME")
+            "WALLPAPER_LOCK_NEXT" -> cycleWallpaperAction("NEXT", screenType = "LOCK")
+            "WALLPAPER_IMAGES_NEXT" -> cycleWallpaperAction("NEXT", sourceFilter = "IMAGES_ONLY")
+            "WALLPAPER_FOLDER_NEXT" -> cycleWallpaperAction("NEXT", sourceFilter = "FOLDER_ONLY")
             else -> {}
+        }
+    }
+
+    private fun cycleWallpaperAction(
+        direction: String,
+        screenType: String? = null,
+        sourceFilter: String? = null
+    ) {
+        serviceScope.launch(Dispatchers.IO) {
+            val wallpaperManager = try { WallpaperManager.getInstance(this@NotchAccessibilityService) } catch (_: Exception) { null }
+            val isLiveActive = try { wallpaperManager?.wallpaperInfo != null } catch (_: Exception) { false }
+
+            if (isLiveActive) {
+                // Live wallpaper is currently active on phone: cycle through configured live wallpapers & presets
+                val newConfig = LiveWallpaperManager.cycleLiveWallpaper(
+                    context = this@NotchAccessibilityService,
+                    direction = direction
+                )
+                withContext(Dispatchers.Main) {
+                    vibrateFeedback()
+                    Toast.makeText(
+                        this@NotchAccessibilityService,
+                        "Live Wallpaper: ${newConfig.title}",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            } else {
+                // Static wallpaper is active on phone: cycle static image/folder wallpaper
+                val changed = WallpaperWorker.cycleWallpaper(
+                    context = this@NotchAccessibilityService,
+                    direction = direction,
+                    preferredScreenType = screenType,
+                    sourceFilter = sourceFilter
+                )
+                withContext(Dispatchers.Main) {
+                    if (changed) {
+                        vibrateFeedback()
+                    } else {
+                        Toast.makeText(
+                            this@NotchAccessibilityService,
+                            "No wallpapers configured in Wallpaper Changer. Please select images or a folder first.",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                }
+            }
         }
     }
 
@@ -1243,7 +1741,31 @@ class NotchAccessibilityService : AccessibilityService() {
                     val intent = Intent.parseUri(extra, Intent.URI_INTENT_SCHEME).apply {
                         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                     }
-                    startActivity(intent)
+                    try {
+                        startActivity(intent)
+                    } catch (se: SecurityException) {
+                        val targetPkg = intent.`package` ?: intent.component?.packageName ?: action.packageToLaunch
+                        if (targetPkg != null) {
+                            val fallbackIntent = Intent(intent.action ?: Intent.ACTION_VIEW).apply {
+                                data = intent.data
+                                `package` = targetPkg
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            }
+                            try {
+                                startActivity(fallbackIntent)
+                            } catch (_: Exception) {
+                                val launchIntent = packageManager.getLaunchIntentForPackage(targetPkg)
+                                if (launchIntent != null) {
+                                    launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                    startActivity(launchIntent)
+                                } else {
+                                    throw se
+                                }
+                            }
+                        } else {
+                            throw se
+                        }
+                    }
                 }
             }
         } catch (e: Exception) {
@@ -2096,41 +2618,6 @@ class NotchAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun showRecordingNotification(isFront: Boolean) {
-        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        
-        val stopIntent = Intent("com.example.ACTION_STOP_RECORDING").apply {
-            setPackage(packageName)
-        }
-        val stopPendingIntent = PendingIntent.getBroadcast(
-            this,
-            0,
-            stopIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
-        val remoteViews = RemoteViews(packageName, com.example.R.layout.notification_recording)
-        remoteViews.setTextViewText(com.example.R.id.tv_record_title, if (isFront) "Spy Cam (Front)" else "Spy Cam (Back)")
-        remoteViews.setChronometer(com.example.R.id.chronometer_record, SystemClock.elapsedRealtime(), null, true)
-        remoteViews.setOnClickPendingIntent(com.example.R.id.btn_stop_record, stopPendingIntent)
-
-        val notification = NotificationCompat.Builder(this, RECORDING_CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.presence_video_busy)
-            .setCustomContentView(remoteViews)
-            .setCustomBigContentView(remoteViews)
-            .setOngoing(true)
-            .setPriority(NotificationCompat.PRIORITY_MAX)
-            .setSound(null)
-            .build()
-
-        manager.notify(RECORDING_NOTIFICATION_ID, notification)
-    }
-
-    private fun hideRecordingNotification() {
-        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        manager.cancel(RECORDING_NOTIFICATION_ID)
-    }
-
     private fun startBackCameraRecord() {
         if (checkSelfPermission(android.Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             handler.post {
@@ -2233,8 +2720,8 @@ class NotchAccessibilityService : AccessibilityService() {
             isRecordingBack = true
             handler.post {
                 Toast.makeText(this, "Silent Back Recording Started", Toast.LENGTH_SHORT).show()
-                showRecordingNotification(isFront = false)
             }
+            updateStopRecordingTile(this)
 
         } catch (e: Exception) {
             Log.e(TAG, "Error starting back camera record", e)
@@ -2272,7 +2759,7 @@ class NotchAccessibilityService : AccessibilityService() {
             backCamera = null
         }
         isRecordingBack = false
-        hideRecordingNotification()
+        updateStopRecordingTile(this)
         handler.post {
             Toast.makeText(this, "Silent Back Recording Saved in spy cam", Toast.LENGTH_SHORT).show()
         }
@@ -2289,6 +2776,7 @@ class NotchAccessibilityService : AccessibilityService() {
         } catch (_: Exception) {}
         backCamera = null
         isRecordingBack = false
+        updateStopRecordingTile(this)
     }
 
     private fun startFrontCameraRecord() {
@@ -2393,8 +2881,8 @@ class NotchAccessibilityService : AccessibilityService() {
             isRecordingFront = true
             handler.post {
                 Toast.makeText(this, "Silent Front Recording Started", Toast.LENGTH_SHORT).show()
-                showRecordingNotification(isFront = true)
             }
+            updateStopRecordingTile(this)
 
         } catch (e: Exception) {
             Log.e(TAG, "Error starting front camera record", e)
@@ -2432,7 +2920,7 @@ class NotchAccessibilityService : AccessibilityService() {
             frontCamera = null
         }
         isRecordingFront = false
-        hideRecordingNotification()
+        updateStopRecordingTile(this)
         handler.post {
             Toast.makeText(this, "Silent Front Recording Saved in spy cam", Toast.LENGTH_SHORT).show()
         }
@@ -2449,14 +2937,24 @@ class NotchAccessibilityService : AccessibilityService() {
         } catch (_: Exception) {}
         frontCamera = null
         isRecordingFront = false
+        updateStopRecordingTile(this)
     }
 
-    private fun isForegroundAppExcluded(): Boolean {
+    @Volatile
+    private var isOverlayHidden = false
+    private var cachedExcludedSet: Set<String>? = null
+    private var lastExcludedPrefsCheckTime = 0L
+
+    fun isForegroundAppExcluded(): Boolean {
         val pkg = currentForegroundPackage ?: return false
         if (pkg == packageName) return false // Never exclude our own app so we can configure it
-        val prefs = getSharedPreferences("excluded_apps_prefs", Context.MODE_PRIVATE)
-        val excludedSet = prefs.getStringSet("excluded_packages", emptySet()) ?: emptySet()
-        return excludedSet.contains(pkg)
+        val now = SystemClock.uptimeMillis()
+        if (cachedExcludedSet == null || now - lastExcludedPrefsCheckTime > 4000L) {
+            val prefs = getSharedPreferences("excluded_apps_prefs", Context.MODE_PRIVATE)
+            cachedExcludedSet = prefs.getStringSet("excluded_packages", emptySet()) ?: emptySet()
+            lastExcludedPrefsCheckTime = now
+        }
+        return cachedExcludedSet?.contains(pkg) == true
     }
 
     private fun isCurrentWindowFullScreen(): Boolean {
@@ -2490,8 +2988,18 @@ class NotchAccessibilityService : AccessibilityService() {
         return false
     }
 
+    private val overlayVisibilityRunnable = Runnable {
+        applyOverlayVisibility()
+    }
+
     private fun updateOverlayVisibility() {
-        val isExcluded = isForegroundAppExcluded() || isCurrentWindowFullScreen()
+        handler.removeCallbacks(overlayVisibilityRunnable)
+        handler.postDelayed(overlayVisibilityRunnable, 60L)
+    }
+
+    private fun applyOverlayVisibility() {
+        val isExcluded = isForegroundAppExcluded() || isCurrentWindowFullScreen() || !notchMasterEnabled
+        isOverlayHidden = isExcluded
         handler.post {
             try {
                 // Update Notch Overlay Container Layout Params
@@ -2513,13 +3021,35 @@ class NotchAccessibilityService : AccessibilityService() {
                                 Log.d(TAG, "Notch overlay hidden (excluded/fullscreen)")
                             }
                         } else {
-                            if (params.width != widthPx || params.height != heightPx || (params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE) != 0) {
-                                params.width = widthPx
-                                params.height = heightPx
-                                params.flags = params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
-                                overlay.visibility = View.VISIBLE
+                            val isDynamic = DynamicNotchManager.isDynamicNotchEnabled.value
+                            val behavior = DynamicNotchManager.activeBehavior.value
+                            val activeCapsule = DynamicNotchManager.currentCapsuleEvent.value ?: DynamicNotchManager.liveActivityEvent.value
+                            val targetWidth = if (isDynamic) {
+                                if (activeCapsule != null) {
+                                    (240 * density).toInt().coerceAtLeast(widthPx)
+                                } else {
+                                    widthPx.coerceAtLeast((140 * density).toInt())
+                                }
+                            } else {
+                                widthPx
+                            }
+                            val targetHeight = if (isDynamic) {
+                                if (activeCapsule != null && activeCapsule.actionButtons.isNotEmpty()) {
+                                    (48 * density).toInt().coerceAtLeast(heightPx)
+                                } else {
+                                    heightPx.coerceAtLeast((36 * density).toInt())
+                                }
+                            } else {
+                                heightPx
+                            }
+                            val targetFlags = params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                            overlay.visibility = View.VISIBLE
+                            if (params.width != targetWidth || params.height != targetHeight || params.flags != targetFlags) {
+                                params.width = targetWidth
+                                params.height = targetHeight
+                                params.flags = targetFlags
                                 windowManager.updateViewLayout(overlay, params)
-                                Log.d(TAG, "Notch overlay restored")
+                                Log.d(TAG, "Notch overlay restored (dynamic=$isDynamic w=$targetWidth h=$targetHeight)")
                             }
                         }
                     }
@@ -2636,5 +3166,74 @@ class NotchAccessibilityService : AccessibilityService() {
             Log.e(TAG, "Failed to launch split app: $packageName", e)
             launchApp(packageName)
         }
+    }
+
+    fun toggleAutoClick() {
+        if (autoClickEngine?.isRunning?.value == true) {
+            autoClickEngine?.stop()
+        } else {
+            autoClickEngine?.start()
+        }
+    }
+
+    fun toggleAutoClickFloatingMenu() {
+        serviceScope.launch {
+            val current = repository.autoClickConfigFlow.firstOrNull() ?: AutoClickConfigEntity()
+            val newVisibility = !current.isMenuVisible
+            repository.updateAutoClickConfig(current.copy(isMenuVisible = newVisibility))
+            vibrateSoft()
+        }
+    }
+
+    fun vibrateSoft() {
+        val vibrator = getSystemService(android.content.Context.VIBRATOR_SERVICE) as android.os.Vibrator
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+            vibrator.vibrate(android.os.VibrationEffect.createPredefined(android.os.VibrationEffect.EFFECT_TICK))
+        } else {
+            vibrator.vibrate(20L)
+        }
+    }
+
+    fun vibrateHeavy() {
+        val vibrator = getSystemService(android.content.Context.VIBRATOR_SERVICE) as android.os.Vibrator
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+            vibrator.vibrate(android.os.VibrationEffect.createPredefined(android.os.VibrationEffect.EFFECT_HEAVY_CLICK))
+        } else {
+            vibrator.vibrate(60L)
+        }
+    }
+
+    fun showAutoClickNotification() {
+        val channelId = "autoclick_channel"
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            val channel = android.app.NotificationChannel(
+                channelId,
+                "AutoClicker",
+                android.app.NotificationManager.IMPORTANCE_LOW
+            )
+            val manager = getSystemService(android.app.NotificationManager::class.java)
+            manager.createNotificationChannel(channel)
+        }
+        val stopIntent = android.content.Intent(this, com.example.service.AutoClickActionReceiver::class.java).apply {
+            action = "STOP_AUTOCLICK"
+        }
+        val stopPendingIntent = android.app.PendingIntent.getBroadcast(
+            this, 0, stopIntent,
+            android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+        )
+        val notification = androidx.core.app.NotificationCompat.Builder(this, channelId)
+            .setSmallIcon(android.R.drawable.ic_menu_edit)
+            .setContentTitle("AutoClick Studio Running")
+            .setContentText("Tap to stop")
+            .setOngoing(true)
+            .addAction(android.R.drawable.ic_delete, "Stop", stopPendingIntent)
+            .build()
+        val manager = getSystemService(android.content.Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+        manager.notify(1002, notification)
+    }
+
+    fun hideAutoClickNotification() {
+        val manager = getSystemService(android.content.Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+        manager.cancel(1002)
     }
 }

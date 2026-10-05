@@ -220,7 +220,7 @@ object BackupHelper {
                     id = 1,
                     enabled = assistantJson.optBoolean("enabled", true),
                     apiKey = assistantJson.optString("apiKey", ""),
-                    modelName = assistantJson.optString("modelName", "gemini-2.0-flash"),
+                    modelName = assistantJson.optString("modelName", "gemini-3.5-flash"),
                     triggerPrefix = assistantJson.optString("triggerPrefix", "?"),
                     hapticFeedback = assistantJson.optBoolean("hapticFeedback", true),
                     showOverlayPill = assistantJson.optBoolean("showOverlayPill", true),

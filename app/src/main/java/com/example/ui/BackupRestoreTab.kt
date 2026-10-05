@@ -41,6 +41,7 @@ fun BackupRestoreTab(
     val scope = rememberCoroutineScope()
     var isExporting by remember { mutableStateOf(false) }
     var isImporting by remember { mutableStateOf(false) }
+    var showRestartDialog by remember { mutableStateOf(false) }
 
     // Export Document Launcher
     val exportLauncher = rememberLauncherForActivityResult(
@@ -86,7 +87,7 @@ fun BackupRestoreTab(
                             BackupHelper.importFromString(repository, jsonStr)
                         }
                         if (success) {
-                            Toast.makeText(context, "Settings imported successfully!", Toast.LENGTH_LONG).show()
+                            showRestartDialog = true
                         } else {
                             Toast.makeText(context, "Invalid backup file structure or corrupt data.", Toast.LENGTH_LONG).show()
                         }
@@ -295,5 +296,31 @@ fun BackupRestoreTab(
                 }
             }
         }
+    }
+
+    if (showRestartDialog) {
+        AlertDialog(
+            onDismissRequest = { },
+            title = { Text("Restart Required") },
+            text = { Text("Backup imported successfully. The app needs to restart to apply all settings correctly.") },
+            confirmButton = {
+                Button(onClick = {
+                    showRestartDialog = false
+                    val packageManager = context.packageManager
+                    val intent = packageManager.getLaunchIntentForPackage(context.packageName)
+                    val componentName = intent?.component
+                    if (componentName != null) {
+                        val prefs = context.getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
+                        prefs.edit().putBoolean("just_restored_backup", true).apply()
+                        
+                        val mainIntent = android.content.Intent.makeRestartActivityTask(componentName)
+                        context.startActivity(mainIntent)
+                        Runtime.getRuntime().exit(0)
+                    }
+                }) {
+                    Text("Restart Now")
+                }
+            }
+        )
     }
 }

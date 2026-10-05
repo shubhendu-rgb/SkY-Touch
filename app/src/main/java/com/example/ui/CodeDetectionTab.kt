@@ -70,6 +70,16 @@ fun CodeDetectionTab(
     val context = LocalContext.current
     val scrollState = rememberScrollState()
 
+    // Local state for fast text field updates
+    var keywordFilterState by remember { mutableStateOf(config.keywordFilter) }
+    var prototypeMessageState by remember { mutableStateOf(config.prototypeMessage) }
+    var customRegexState by remember { mutableStateOf(config.customRegex) }
+
+    // Sync from config if they differ (e.g. initial load)
+    LaunchedEffect(config.keywordFilter) { if (config.keywordFilter != keywordFilterState) keywordFilterState = config.keywordFilter }
+    LaunchedEffect(config.prototypeMessage) { if (config.prototypeMessage != prototypeMessageState) prototypeMessageState = config.prototypeMessage }
+    LaunchedEffect(config.customRegex) { if (config.customRegex != customRegexState) customRegexState = config.customRegex }
+
     // Notification & SMS permissions state
     var isNotificationAccessGranted by remember { mutableStateOf(false) }
     var isPostNotificationPermissionGranted by remember { mutableStateOf(true) }
@@ -1119,8 +1129,11 @@ fun CodeDetectionTab(
                         color = MaterialTheme.colorScheme.onSurface
                     )
                     OutlinedTextField(
-                        value = config.keywordFilter,
-                        onValueChange = { onConfigChangeDebounced(config.copy(keywordFilter = it)) },
+                        value = keywordFilterState,
+                        onValueChange = { 
+                            keywordFilterState = it
+                            onConfigChangeDebounced(config.copy(keywordFilter = it)) 
+                        },
                         modifier = Modifier.fillMaxWidth(),
                         minLines = 2,
                         maxLines = 3,
@@ -1145,8 +1158,11 @@ fun CodeDetectionTab(
                         color = MaterialTheme.colorScheme.onSurface
                     )
                     OutlinedTextField(
-                        value = config.prototypeMessage,
-                        onValueChange = { onConfigChangeDebounced(config.copy(prototypeMessage = it)) },
+                        value = prototypeMessageState,
+                        onValueChange = { 
+                            prototypeMessageState = it
+                            onConfigChangeDebounced(config.copy(prototypeMessage = it)) 
+                        },
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(24.dp),
                         placeholder = { Text("e.g. Your verification code is [CODE]") }
@@ -1192,8 +1208,11 @@ fun CodeDetectionTab(
                     }
 
                     OutlinedTextField(
-                        value = config.customRegex,
-                        onValueChange = { onConfigChangeDebounced(config.copy(customRegex = it)) },
+                        value = customRegexState,
+                        onValueChange = { 
+                            customRegexState = it
+                            onConfigChangeDebounced(config.copy(customRegex = it)) 
+                        },
                         modifier = Modifier.fillMaxWidth(),
                         placeholder = { Text("""e.g. \b\d{6}\b or code:\s*(\w+)""") },
                         shape = RoundedCornerShape(24.dp),
@@ -1299,7 +1318,8 @@ fun CodeDetectionTab(
                         verticalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         detectedCodes.forEach { item ->
-                            Card(
+                            key(item.id) {
+                                Card(
                                 shape = RoundedCornerShape(16.dp),
                                 colors = CardDefaults.cardColors(
                                     containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f)
@@ -1387,6 +1407,7 @@ fun CodeDetectionTab(
                                 }
                             }
                         }
+                    }
                     }
                 }
             }
