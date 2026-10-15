@@ -3,6 +3,7 @@ package com.example.service.tiles
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
 import android.widget.Toast
+import com.example.service.WallpaperRules
 import com.example.service.WallpaperWorker
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -27,7 +28,11 @@ class WallpaperFolderTileService : TileService() {
 
         scope.launch {
             try {
-                val changed = WallpaperWorker.applyNextWallpaperNow(applicationContext, sourceFilter = "FOLDER_ONLY")
+                val changed = WallpaperWorker.applyRule(
+                    context = applicationContext,
+                    trigger = WallpaperRules.TRIGGER_TILE_FOLDER,
+                    sourceOverride = "FOLDER_ONLY"
+                )
                 withContext(Dispatchers.Main) {
                     tile.state = Tile.STATE_INACTIVE
                     tile.updateTile()

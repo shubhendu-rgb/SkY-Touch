@@ -595,168 +595,145 @@ class WallpaperWorker(
         }
 
         /**
-         * Fast direct wallpaper execution invoked immediately by Quick Tiles.
-         * Works even if auto wallpaper is disabled (isEnabled == false).
-         * @param sourceFilter "IMAGES_ONLY" for individual images tile, "FOLDER_ONLY" for folder tile, null for any.
+         * Rule-driven wallpaper change used by the Quick Settings tiles and the notch gestures.
+         *
+         * The rule (see [WallpaperRules]) decides which screen(s) change, where the picture comes from
+         * and whether Home and Lock share the same picture. Works even when the automatic changer is off.
+         *
+         * If a target screen has no pictures of its own, it borrows the other screen's pictures, so a
+         * "Both" rule can no longer end up changing only the screen that happens to have images.
+         *
+         * @param direction "NEXT", "PREV" or "RANDOM".
+         * @param targetOverride "HOME" or "LOCK" to force a single screen (explicit gesture actions).
+         * @param sourceOverride "IMAGES_ONLY" / "FOLDER_ONLY" to force the source (tiles, explicit gesture actions).
          */
-        suspend fun applyNextWallpaperNow(context: Context, preferredScreenType: String? = null, sourceFilter: String? = null): Boolean = withContext(Dispatchers.IO) {
+        suspend fun applyRule(
+            context: Context,
+            trigger: String,
+            direction: String = "NEXT",
+            targetOverride: String? = null,
+            sourceOverride: String? = null
+        ): Boolean = withContext(Dispatchers.IO) {
             try {
-                val db = AppDatabase.getDatabase(context)
-                val dao = db.wallpaperConfigDao()
+                val rule = WallpaperRules.load(context, trigger)
+                val target = targetOverride ?: rule.target
+                val filter = sourceOverride ?: rule.sourceFilter
+                val effectiveDirection =
+                    if (direction == "NEXT" &&
+                        trigger != WallpaperRules.TRIGGER_GESTURE &&
+                        rule.order == WallpaperRules.ORDER_RANDOM
+                    ) "RANDOM" else direction
 
-                val targetConfigs = if (preferredScreenType != null) {
-                    listOfNotNull(dao.getConfig(preferredScreenType))
-                } else {
-                    val all = dao.getAllConfigs()
-                    if (all.isNotEmpty()) all else listOf(
-                        dao.getConfig("HOME") ?: WallpaperConfigEntity(screenType = "HOME"),
-                        dao.getConfig("LOCK") ?: WallpaperConfigEntity(screenType = "LOCK")
-                    )
+                val dao = AppDatabase.getDatabase(context).wallpaperConfigDao()
+                val home = dao.getConfig("HOME") ?: WallpaperConfigEntity(screenType = "HOME")
+                val lock = dao.getConfig("LOCK") ?: WallpaperConfigEntity(screenType = "LOCK")
+
+                val homePool = collectAllCandidateUris(context, home, filter)
+                val lockPool = collectAllCandidateUris(context, lock, filter)
+                if (homePool.isEmpty() && lockPool.isEmpty()) {
+                    Log.w("WallpaperWorker", "applyRule($trigger): no pictures for filter=$filter")
+                    return@withContext false
                 }
 
-                // Find a config with available images matching the source filter
+                val prefs = context.getSharedPreferences("wallpaper_cycle_prefs", Context.MODE_PRIVATE)
+                val filterKey = filter ?: "ALL"
+                val screens = when (target) {
+                    WallpaperRules.TARGET_HOME -> listOf(home)
+                    WallpaperRules.TARGET_LOCK -> listOf(lock)
+                    else -> listOf(home, lock)
+                }
+
+                if (screens.size == 2 && rule.sameOnBoth) {
+                    // One picture for both screens.
+                    val pool = (homePool + lockPool).distinct()
+                    val uri = pickUri(prefs, "idx_SYNC_$filterKey", pool, effectiveDirection)
+                    val ok = applyUriToConfigs(context, uri, screens)
+                    Log.i("WallpaperWorker", "applyRule($trigger): synced $effectiveDirection on both screens -> $ok")
+                    return@withContext ok
+                }
+
                 var appliedAny = false
-                for (config in targetConfigs) {
-                    val candidates = collectAllCandidateUris(context, config, sourceFilter)
-                    if (candidates.isNotEmpty()) {
-                        val applied = applyWallpaperForConfig(context, config, sourceFilter, preloadedCandidates = candidates)
-                        if (applied) {
-                            appliedAny = true
-                        }
-                    }
+                for (config in screens) {
+                    val ownPool = if (config.screenType == "LOCK") lockPool else homePool
+                    val otherPool = if (config.screenType == "LOCK") homePool else lockPool
+                    val pool = ownPool.ifEmpty { otherPool }
+                    if (pool.isEmpty()) continue
+                    val uri = pickUri(prefs, "idx_${config.screenType}_$filterKey", pool, effectiveDirection)
+                    if (applyUriToConfigs(context, uri, listOf(config))) appliedAny = true
                 }
-
-                // If nothing had images in the target screen, check all configs
-                if (!appliedAny) {
-                    val all = dao.getAllConfigs()
-                    for (config in all) {
-                        val candidates = collectAllCandidateUris(context, config, sourceFilter)
-                        if (candidates.isNotEmpty()) {
-                            val applied = applyWallpaperForConfig(context, config, sourceFilter, preloadedCandidates = candidates)
-                            if (applied) {
-                                appliedAny = true
-                                break
-                            }
-                        }
-                    }
-                }
-
+                Log.i("WallpaperWorker", "applyRule($trigger): $effectiveDirection on $target -> $appliedAny")
                 appliedAny
             } catch (e: Exception) {
-                Log.e("WallpaperWorker", "Error in applyNextWallpaperNow: ${e.message}", e)
+                Log.e("WallpaperWorker", "Error in applyRule($trigger): ${e.message}", e)
                 false
             }
         }
 
-        /**
-         * Cycles wallpaper in a specific direction (NEXT, PREV, RANDOM) for notch gestures.
-         * Maintains index per screen type and source filter.
-         */
-        suspend fun cycleWallpaper(
-            context: Context,
-            direction: String = "NEXT",
-            preferredScreenType: String? = null,
-            sourceFilter: String? = null
-        ): Boolean = withContext(Dispatchers.IO) {
-            try {
-                val db = AppDatabase.getDatabase(context)
-                val dao = db.wallpaperConfigDao()
-
-                val targetConfigs = if (preferredScreenType != null) {
-                    val cfg = dao.getConfig(preferredScreenType)
-                    if (cfg != null) listOf(cfg) else emptyList()
-                } else {
-                    val all = dao.getAllConfigs()
-                    if (all.isNotEmpty()) all else listOf(
-                        dao.getConfig("HOME") ?: WallpaperConfigEntity(screenType = "HOME"),
-                        dao.getConfig("LOCK") ?: WallpaperConfigEntity(screenType = "LOCK")
-                    )
+        /** Picks the next / previous / random entry and remembers the position under [key]. */
+        private fun pickUri(
+            prefs: android.content.SharedPreferences,
+            key: String,
+            pool: List<Uri>,
+            direction: String
+        ): Uri {
+            val last = prefs.getInt(key, -1).takeIf { it in pool.indices } ?: -1
+            val newIdx = when (direction) {
+                "PREV" -> if (last <= 0) pool.size - 1 else last - 1
+                "RANDOM" -> {
+                    if (pool.size > 1) {
+                        var r = pool.indices.random()
+                        if (r == last) r = (r + 1) % pool.size
+                        r
+                    } else 0
                 }
-
-                val prefs = context.getSharedPreferences("wallpaper_cycle_prefs", Context.MODE_PRIVATE)
-                var appliedAny = false
-
-                for (config in targetConfigs) {
-                    val candidates = collectAllCandidateUris(context, config, sourceFilter)
-                    if (candidates.isNotEmpty()) {
-                        val key = "idx_${config.screenType}_${sourceFilter ?: "ALL"}"
-                        val lastIdx = prefs.getInt(key, -1)
-                        val newIdx = when (direction) {
-                            "PREV" -> {
-                                if (lastIdx <= 0) candidates.size - 1 else lastIdx - 1
-                            }
-                            "RANDOM" -> {
-                                if (candidates.size > 1) {
-                                    var r = candidates.indices.random()
-                                    if (r == lastIdx) r = (r + 1) % candidates.size
-                                    r
-                                } else 0
-                            }
-                            else -> { // "NEXT"
-                                (lastIdx + 1) % candidates.size
-                            }
-                        }
-                        prefs.edit().putInt(key, newIdx).apply()
-                        val selectedUri = candidates[newIdx]
-
-                        val bitmap = processBitmap(
-                            context = context,
-                            uri = selectedUri,
-                            applyGradient = config.applyGradient,
-                            applyGrayscale = config.applyGrayscale,
-                            cropAlignment = config.cropAlignment,
-                            isScrollable = config.isScrollable,
-                            blurRadius = config.blurRadius
-                        )
-
-                        if (bitmap != null) {
-                            val wallpaperManager = WallpaperManager.getInstance(context)
-                            val flag = if (config.screenType == "LOCK") WallpaperManager.FLAG_LOCK else WallpaperManager.FLAG_SYSTEM
-                            wallpaperManager.setBitmap(bitmap, null, false, flag)
-                            Log.i("WallpaperWorker", "Cycled wallpaper for ${config.screenType} ($direction: idx $newIdx/${candidates.size})")
-                            appliedAny = true
-                        }
-                    }
-                }
-
-                // If specific screenType had no candidates, try finding any configured wallpaper
-                if (!appliedAny && preferredScreenType != null) {
-                    val all = dao.getAllConfigs()
-                    for (config in all) {
-                        val candidates = collectAllCandidateUris(context, config, sourceFilter)
-                        if (candidates.isNotEmpty()) {
-                            val key = "idx_${config.screenType}_${sourceFilter ?: "ALL"}"
-                            val lastIdx = prefs.getInt(key, -1)
-                            val newIdx = (lastIdx + 1) % candidates.size
-                            prefs.edit().putInt(key, newIdx).apply()
-                            val selectedUri = candidates[newIdx]
-
-                            val bitmap = processBitmap(
-                                context = context,
-                                uri = selectedUri,
-                                applyGradient = config.applyGradient,
-                                applyGrayscale = config.applyGrayscale,
-                                cropAlignment = config.cropAlignment,
-                                isScrollable = config.isScrollable,
-                                blurRadius = config.blurRadius
-                            )
-
-                            if (bitmap != null) {
-                                val wallpaperManager = WallpaperManager.getInstance(context)
-                                val flag = if (config.screenType == "LOCK") WallpaperManager.FLAG_LOCK else WallpaperManager.FLAG_SYSTEM
-                                wallpaperManager.setBitmap(bitmap, null, false, flag)
-                                appliedAny = true
-                                break
-                            }
-                        }
-                    }
-                }
-
-                appliedAny
-            } catch (e: Exception) {
-                Log.e("WallpaperWorker", "Error in cycleWallpaper: ${e.message}", e)
-                false
+                else -> (last + 1) % pool.size
             }
+            prefs.edit().putInt(key, newIdx).apply()
+            return pool[newIdx]
+        }
+
+        private fun sameLook(a: WallpaperConfigEntity, b: WallpaperConfigEntity): Boolean =
+            a.applyGradient == b.applyGradient &&
+                a.applyGrayscale == b.applyGrayscale &&
+                a.cropAlignment == b.cropAlignment &&
+                a.isScrollable == b.isScrollable &&
+                a.blurRadius == b.blurRadius
+
+        /**
+         * Applies [uri] to the given screens, each with its own visual effects.
+         * When both screens use identical effects the picture is processed once and set in a single call.
+         */
+        private fun applyUriToConfigs(context: Context, uri: Uri, configs: List<WallpaperConfigEntity>): Boolean {
+            val wallpaperManager = WallpaperManager.getInstance(context)
+            val first = configs.first()
+
+            fun process(config: WallpaperConfigEntity): Bitmap? = processBitmap(
+                context = context,
+                uri = uri,
+                applyGradient = config.applyGradient,
+                applyGrayscale = config.applyGrayscale,
+                cropAlignment = config.cropAlignment,
+                isScrollable = config.isScrollable,
+                blurRadius = config.blurRadius
+            )
+
+            if (configs.size > 1 && configs.all { sameLook(it, first) }) {
+                val bitmap = process(first) ?: return false
+                wallpaperManager.setBitmap(
+                    bitmap, null, false,
+                    WallpaperManager.FLAG_SYSTEM or WallpaperManager.FLAG_LOCK
+                )
+                return true
+            }
+
+            var ok = false
+            for (config in configs) {
+                val bitmap = process(config) ?: continue
+                val flag = if (config.screenType == "LOCK") WallpaperManager.FLAG_LOCK else WallpaperManager.FLAG_SYSTEM
+                wallpaperManager.setBitmap(bitmap, null, false, flag)
+                ok = true
+            }
+            return ok
         }
 
         /**

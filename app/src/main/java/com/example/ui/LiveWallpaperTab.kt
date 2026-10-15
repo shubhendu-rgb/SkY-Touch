@@ -1498,18 +1498,21 @@ fun AutoChangeLiveWallpaperCard(
     var scheduledTime by remember { mutableStateOf(LiveWallpaperManager.getAutoChangeScheduledTime(context)) }
     var isRandom by remember { mutableStateOf(LiveWallpaperManager.isAutoChangeRandom(context)) }
 
-    val timePickerDialog = TimePickerDialog(
-        context,
-        { _, hourOfDay, minute ->
-            val formatted = String.format("%02d:%02d", hourOfDay, minute)
-            scheduledTime = formatted
-            LiveWallpaperManager.setAutoChangeScheduledTime(context, formatted)
-            if (isEnabled) {
-                LiveWallpaperWorker.scheduleWork(context)
-            }
-        },
-        9, 0, true
-    )
+    // Built only when the user taps (creating a Dialog on every recomposition made this screen laggy).
+    val showTimePicker: () -> Unit = {
+        TimePickerDialog(
+            context,
+            { _, hourOfDay, minute ->
+                val formatted = String.format("%02d:%02d", hourOfDay, minute)
+                scheduledTime = formatted
+                LiveWallpaperManager.setAutoChangeScheduledTime(context, formatted)
+                if (isEnabled) {
+                    LiveWallpaperWorker.scheduleWork(context)
+                }
+            },
+            9, 0, true
+        ).show()
+    }
 
     Card(
         modifier = Modifier.fillMaxWidth().testTag("card_live_auto_change"),
@@ -1614,7 +1617,7 @@ fun AutoChangeLiveWallpaperCard(
                             Text(scheduledTime, fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Color(0xFF64B5F6))
                         }
                         OutlinedButton(
-                            onClick = { timePickerDialog.show() },
+                            onClick = { showTimePicker() },
                             colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
                             border = BorderStroke(1.dp, Color.White.copy(alpha = 0.4f))
                         ) {

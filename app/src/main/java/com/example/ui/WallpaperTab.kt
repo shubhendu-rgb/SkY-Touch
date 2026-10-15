@@ -279,18 +279,21 @@ fun StaticWallpaperScreen(
         }
     }
 
-    val timePickerDialog = TimePickerDialog(
-        context,
-        { _, hourOfDay, minute ->
-            val formattedTime = String.format("%02d:%02d", hourOfDay, minute)
-            scope.launch {
-                val updated = config.copy(scheduledTime = formattedTime)
-                dao.saveConfig(updated)
-                WallpaperWorker.scheduleWallpaperWork(context, updated)
-            }
-        },
-        12, 0, true
-    )
+    // Built only when the user taps (creating a Dialog on every recomposition made this screen laggy).
+    val showTimePicker: () -> Unit = {
+        TimePickerDialog(
+            context,
+            { _, hourOfDay, minute ->
+                val formattedTime = String.format("%02d:%02d", hourOfDay, minute)
+                scope.launch {
+                    val updated = config.copy(scheduledTime = formattedTime)
+                    dao.saveConfig(updated)
+                    WallpaperWorker.scheduleWallpaperWork(context, updated)
+                }
+            },
+            12, 0, true
+        ).show()
+    }
 
     val hasAnyWallpapers = !config.folderUri.isNullOrEmpty() || individualImages.isNotEmpty()
 
@@ -974,87 +977,9 @@ fun StaticWallpaperScreen(
                         }
                     }
 
-                    // CARD 4: Instant Wallpaper Change
+                    // CARD 4: Tile & Gesture Rules (how the QS tiles and wallpaper gestures behave)
                     item {
-                        Card(
-                            modifier = Modifier.fillMaxWidth().testTag("card_instant_switch"),
-                            shape = RoundedCornerShape(20.dp),
-                            colors = CardDefaults.cardColors(containerColor = Color.Black.copy(alpha = 0.35f)),
-                            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.22f))
-                        ) {
-                            Column(
-                                modifier = Modifier.padding(16.dp),
-                                verticalArrangement = Arrangement.spacedBy(12.dp)
-                            ) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                ) {
-                                    Icon(Icons.Default.Bolt, contentDescription = null, tint = Color(0xFF64B5F6))
-                                    Text("Instant Wallpaper Change", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = Color.White)
-                                }
-                                Text(
-                                    text = "Changes wallpaper immediately in milliseconds. Two Quick Settings tiles are available in your status bar:\n• 'Wallpaper: Images' for selected photos\n• 'Wallpaper: Folder' for folder images\nBoth tiles work instantly even when wallpaper changer is turned off!",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = Color.White.copy(alpha = 0.8f)
-                                )
-
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                ) {
-                                    FilledTonalButton(
-                                        onClick = {
-                                            scope.launch {
-                                                val success = WallpaperWorker.applyNextWallpaperNow(context, screenType, "IMAGES_ONLY")
-                                                withContext(Dispatchers.Main) {
-                                                    if (success) {
-                                                        Toast.makeText(context, "$screenType wallpaper changed from images!", Toast.LENGTH_SHORT).show()
-                                                    } else {
-                                                        Toast.makeText(context, "Please add images above first.", Toast.LENGTH_SHORT).show()
-                                                    }
-                                                }
-                                            }
-                                        },
-                                        modifier = Modifier.weight(1f).testTag("btn_next_images"),
-                                        enabled = individualImages.isNotEmpty(),
-                                        colors = ButtonDefaults.filledTonalButtonColors(
-                                            containerColor = Color.White.copy(alpha = 0.18f),
-                                            contentColor = Color.White
-                                        )
-                                    ) {
-                                        Icon(imageVector = Icons.Default.Image, contentDescription = null, modifier = Modifier.size(16.dp))
-                                        Spacer(modifier = Modifier.width(6.dp))
-                                        Text("From Images")
-                                    }
-
-                                    FilledTonalButton(
-                                        onClick = {
-                                            scope.launch {
-                                                val success = WallpaperWorker.applyNextWallpaperNow(context, screenType, "FOLDER_ONLY")
-                                                withContext(Dispatchers.Main) {
-                                                    if (success) {
-                                                        Toast.makeText(context, "$screenType wallpaper changed from folder!", Toast.LENGTH_SHORT).show()
-                                                    } else {
-                                                        Toast.makeText(context, "Please select a folder above first.", Toast.LENGTH_SHORT).show()
-                                                    }
-                                                }
-                                            }
-                                        },
-                                        modifier = Modifier.weight(1f).testTag("btn_next_folder"),
-                                        enabled = !config.folderUri.isNullOrEmpty(),
-                                        colors = ButtonDefaults.filledTonalButtonColors(
-                                            containerColor = Color.White.copy(alpha = 0.18f),
-                                            contentColor = Color.White
-                                        )
-                                    ) {
-                                        Icon(imageVector = Icons.Default.Folder, contentDescription = null, modifier = Modifier.size(16.dp))
-                                        Spacer(modifier = Modifier.width(6.dp))
-                                        Text("From Folder")
-                                    }
-                                }
-                            }
-                        }
+                        WallpaperRulesCard()
                     }
 
                     // CARD 5: Automatic Rotation Schedule Settings
@@ -1156,7 +1081,7 @@ fun StaticWallpaperScreen(
                                                 Text(config.scheduledTime ?: "Not Set", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Color(0xFF64B5F6))
                                             }
                                             OutlinedButton(
-                                                onClick = { timePickerDialog.show() },
+                                                onClick = { showTimePicker() },
                                                 colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
                                                 border = BorderStroke(1.dp, Color.White.copy(alpha = 0.4f))
                                             ) {

@@ -111,6 +111,8 @@ class MainActivity : ComponentActivity() {
         db = AppDatabase.getDatabase(this)
         repository = NotchRepository(db)
         OtpNotificationHelper.createNotificationChannel(this)
+        com.example.service.audio.EqualizerController.init(this)
+        com.example.service.audio.EqualizerController.ensureService(this)
         com.example.ui.island.DynamicNotchManager.initialize(this)
 
         enableEdgeToEdge(statusBarStyle = androidx.activity.SystemBarStyle.auto(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT), navigationBarStyle = androidx.activity.SystemBarStyle.auto(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT))
@@ -210,7 +212,7 @@ fun isAccessibilityServiceEnabled(context: Context, serviceClass: Class<*>): Boo
 }
 
 enum class ScreenType {
-    DASHBOARD, GESTURES, CALIBRATION, SIDE_DECK, CODE_DETECTION, TEXT_ASSISTANT, AUTOCLICK, ANALYTICS, DEVELOPER, RECORDINGS, EXCLUDED_APPS, INSTRUCTIONS, BACKUP_RESTORE, WALLPAPER, LIVE_WALLPAPER, DYNAMIC_NOTCH
+    DASHBOARD, GESTURES, CALIBRATION, SIDE_DECK, CODE_DETECTION, TEXT_ASSISTANT, AUTOCLICK, ANALYTICS, DEVELOPER, RECORDINGS, EXCLUDED_APPS, INSTRUCTIONS, BACKUP_RESTORE, WALLPAPER, LIVE_WALLPAPER, DYNAMIC_NOTCH, EQUALIZER
 }
 
 
@@ -286,10 +288,10 @@ fun MainContentScreen(
     }
 
     val initialScreen = remember {
-        if ((context as? ComponentActivity)?.intent?.getStringExtra("OPEN_SCREEN") == "CODE_DETECTION") {
-            ScreenType.CODE_DETECTION
-        } else {
-            ScreenType.DASHBOARD
+        when ((context as? ComponentActivity)?.intent?.getStringExtra("OPEN_SCREEN")) {
+            "CODE_DETECTION" -> ScreenType.CODE_DETECTION
+            "EQUALIZER" -> ScreenType.EQUALIZER
+            else -> ScreenType.DASHBOARD
         }
     }
     var currentScreen by remember { mutableStateOf(initialScreen) }
@@ -359,7 +361,9 @@ fun MainContentScreen(
 
     ModalNavigationDrawer(
         drawerState = drawerState,
-        gesturesEnabled = true,
+        // The drawer is only reachable from the Dashboard. Leaving its swipe detector on every
+        // other screen makes taps and sliders compete with it for touch events.
+        gesturesEnabled = currentScreen == ScreenType.DASHBOARD || drawerState.isOpen,
         drawerContent = {
             ModalDrawerSheet(
                 drawerContainerColor = MaterialTheme.colorScheme.surface,
@@ -368,24 +372,7 @@ fun MainContentScreen(
                 Column(
                     modifier = Modifier.fillMaxHeight().padding(24.dp)
                 ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Text("SkY Touch", fontSize = 24.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
-                        Surface(
-                            color = MaterialTheme.colorScheme.primaryContainer,
-                            shape = RoundedCornerShape(6.dp)
-                        ) {
-                            Text(
-                                text = "v8.1",
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.primary,
-                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                            )
-                        }
-                    }
+                    Text("SkY Touch", fontSize = 24.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
                     Spacer(modifier = Modifier.height(32.dp))
                     
                     Text("Theme", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.primary)
@@ -531,6 +518,7 @@ fun MainContentScreen(
                                     ScreenType.WALLPAPER -> "Wallpaper Changer"
                                     ScreenType.LIVE_WALLPAPER -> "Live Wallpaper Studio"
                                     ScreenType.DYNAMIC_NOTCH -> "Dynamic Notch"
+                                    ScreenType.EQUALIZER -> "Equalizer"
                                 },
 
                                 fontWeight = FontWeight.Bold,
@@ -584,15 +572,10 @@ fun MainContentScreen(
                             ) 0.dp else 16.dp
                         )
                 ) {
-                    AnimatedContent(
-                        targetState = currentScreen,
-                        transitionSpec = {
-                            fadeIn(animationSpec = tween(120, easing = LinearOutSlowInEasing))
-                                .togetherWith(fadeOut(animationSpec = tween(80)))
-                        },
-                        label = "screen_transition",
-                        modifier = Modifier.fillMaxSize()
-                    ) { targetScreen ->
+                    // Plain switch instead of AnimatedContent: the cross-fade kept the old screen and the
+                    // new (often heavy) screen composed at the same time, which delayed every open.
+                    Box(modifier = Modifier.fillMaxSize()) {
+                        val targetScreen = currentScreen
                         when (targetScreen) {
                             ScreenType.DASHBOARD -> DashboardScreen(
                                 isServiceRunning = isServiceRunning,
@@ -656,6 +639,7 @@ fun MainContentScreen(
                             ScreenType.LIVE_WALLPAPER -> com.example.ui.LiveWallpaperTab(
                                 onBack = { currentScreen = ScreenType.DASHBOARD }
                             )
+                            ScreenType.EQUALIZER -> com.example.ui.EqualizerTab()
                             ScreenType.DYNAMIC_NOTCH -> com.example.ui.island.DynamicNotchScreen(
                                 onBack = { currentScreen = ScreenType.DASHBOARD },
                                 config = uiState.config,
@@ -1060,6 +1044,14 @@ fun DashboardScreen(
                     description = "Change wallpaper automatically from images or folder with blur, presets & live preview.",
                     icon = Icons.Filled.Wallpaper,
                     onClick = { onNavigate(ScreenType.WALLPAPER) }
+                )
+            }
+            item {
+                DashboardCard(
+                    title = "Equalizer",
+                    description = "Global audio equalizer with presets, bass boost, surround and loudness for all your music & video apps.",
+                    icon = Icons.Filled.Equalizer,
+                    onClick = { onNavigate(ScreenType.EQUALIZER) }
                 )
             }
         }

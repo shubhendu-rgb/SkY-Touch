@@ -1386,10 +1386,23 @@ class NotchAccessibilityService : AccessibilityService() {
 
                         pendingTapRunnable?.let { handler.removeCallbacks(it) }
 
+                        // Only wait for extra taps when a double/triple tap action actually exists;
+                        // otherwise the tap fires immediately instead of after the multi-tap window.
+                        val hasDoubleTap = gestureActions["DOUBLE_TAP"]?.let { it.actionType != "NONE" } == true
+                        val hasTripleTap = gestureActions["TRIPLE_TAP"]?.let { it.actionType != "NONE" } == true
+
                         if (tapCount >= 3) {
                             tapCount = 0
                             pendingTapRunnable = null
                             triggerGestureAction("TRIPLE_TAP")
+                        } else if (tapCount == 1 && !hasDoubleTap && !hasTripleTap) {
+                            tapCount = 0
+                            pendingTapRunnable = null
+                            triggerGestureAction("SINGLE_TAP")
+                        } else if (tapCount == 2 && !hasTripleTap) {
+                            tapCount = 0
+                            pendingTapRunnable = null
+                            triggerGestureAction("DOUBLE_TAP")
                         } else {
                             val currentCount = tapCount
                             pendingTapRunnable = Runnable {
@@ -1547,15 +1560,32 @@ class NotchAccessibilityService : AccessibilityService() {
         sourceFilter: String? = null
     ) {
         serviceScope.launch(Dispatchers.IO) {
+            val rule = WallpaperRules.load(this@NotchAccessibilityService, WallpaperRules.TRIGGER_GESTURE)
+            val target = screenType ?: rule.target
+
             val wallpaperManager = try { WallpaperManager.getInstance(this@NotchAccessibilityService) } catch (_: Exception) { null }
             val isLiveActive = try { wallpaperManager?.wallpaperInfo != null } catch (_: Exception) { false }
 
-            if (isLiveActive) {
+            // A live wallpaper only runs on the Home screen, so it only takes over when the action is
+            // allowed to touch Home and is not explicitly about static images / a folder.
+            val useLive = isLiveActive && sourceFilter == null && target != WallpaperRules.TARGET_LOCK
+
+            if (useLive) {
                 // Live wallpaper is currently active on phone: cycle through configured live wallpapers & presets
                 val newConfig = LiveWallpaperManager.cycleLiveWallpaper(
                     context = this@NotchAccessibilityService,
                     direction = direction
                 )
+                // "Both" rule: Home is live, so the Lock screen still gets its own static change.
+                if (target == WallpaperRules.TARGET_BOTH) {
+                    WallpaperWorker.applyRule(
+                        context = this@NotchAccessibilityService,
+                        trigger = WallpaperRules.TRIGGER_GESTURE,
+                        direction = direction,
+                        targetOverride = WallpaperRules.TARGET_LOCK,
+                        sourceOverride = sourceFilter
+                    )
+                }
                 withContext(Dispatchers.Main) {
                     vibrateFeedback()
                     Toast.makeText(
@@ -1565,12 +1595,13 @@ class NotchAccessibilityService : AccessibilityService() {
                     ).show()
                 }
             } else {
-                // Static wallpaper is active on phone: cycle static image/folder wallpaper
-                val changed = WallpaperWorker.cycleWallpaper(
+                // Static wallpaper: change the screen(s) chosen in the Wallpaper rules.
+                val changed = WallpaperWorker.applyRule(
                     context = this@NotchAccessibilityService,
+                    trigger = WallpaperRules.TRIGGER_GESTURE,
                     direction = direction,
-                    preferredScreenType = screenType,
-                    sourceFilter = sourceFilter
+                    targetOverride = screenType,
+                    sourceOverride = sourceFilter
                 )
                 withContext(Dispatchers.Main) {
                     if (changed) {
