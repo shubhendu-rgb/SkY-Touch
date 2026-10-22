@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Log
 import androidx.work.*
 import com.example.service.wallpaper.LiveWallpaperConfig
+import com.example.service.wallpaper.DefaultWallpaperManager
 import com.example.service.wallpaper.LiveWallpaperManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -16,6 +17,7 @@ class LiveWallpaperWorker(
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         try {
+            if (DefaultWallpaperManager.isPaused(applicationContext)) return@withContext Result.success()
             if (LiveWallpaperManager.isAutoChangeEnabled(applicationContext)) {
                 val nextConfig: LiveWallpaperConfig = LiveWallpaperManager.cycleNextLiveWallpaper(applicationContext)
                 LiveWallpaperManager.setLastAutoChangeTime(applicationContext, System.currentTimeMillis())

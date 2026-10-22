@@ -1559,6 +1559,10 @@ class NotchAccessibilityService : AccessibilityService() {
         screenType: String? = null,
         sourceFilter: String? = null
     ) {
+        if (com.example.service.wallpaper.DefaultWallpaperManager.isPaused(this)) {
+            Toast.makeText(this, "Wallpaper changer is OFF (turn it on with the Wallpaper Changer tile)", Toast.LENGTH_SHORT).show()
+            return
+        }
         serviceScope.launch(Dispatchers.IO) {
             val rule = WallpaperRules.load(this@NotchAccessibilityService, WallpaperRules.TRIGGER_GESTURE)
             val target = screenType ?: rule.target

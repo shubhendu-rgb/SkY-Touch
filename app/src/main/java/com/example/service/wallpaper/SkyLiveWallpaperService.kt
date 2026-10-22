@@ -19,6 +19,7 @@ import android.os.SystemClock
 import android.service.wallpaper.WallpaperService
 import android.util.Log
 import android.view.MotionEvent
+import android.view.Surface
 import android.view.SurfaceHolder
 import java.io.File
 import kotlin.math.cos
@@ -69,15 +70,37 @@ class SkyLiveWallpaperService : WallpaperService() {
         private val handler = Handler(Looper.getMainLooper())
         private var config: LiveWallpaperConfig = LiveWallpaperConfig()
 
+        // Several callers (pref listener, direct call, broadcast) all report the same change.
+        // Collapse them into ONE update so the video player is not torn down 3 times in a row.
+        private val applyConfigRunnable = Runnable { applyConfigChange() }
+
         fun onWallpaperConfigChanged() {
-            handler.post {
-                loadConfig()
+            handler.removeCallbacks(applyConfigRunnable)
+            handler.postDelayed(applyConfigRunnable, 120)
+        }
+
+        private fun applyConfigChange() {
+            val old = config
+            loadConfig()
+            val sameVideo = config.mediaType == LiveMediaType.VIDEO &&
+                old.mediaType == LiveMediaType.VIDEO &&
+                old.mediaPath == config.mediaPath &&
+                old.isMuted == config.isMuted &&
+                old.playbackSpeed == config.playbackSpeed &&
+                !fallbackToPreset && mediaPlayer != null
+            if (sameVideo) {
+                // Only crop / rotate / filter / position changed: no need to restart playback
+                glRenderer?.updateConfig(config)
+            } else {
                 restartEngine()
             }
         }
 
         // Video components
         private var mediaPlayer: MediaPlayer? = null
+        @Volatile private var playerPrepared = false
+        private var prepareStartTime = 0L
+        private var videoErrorCount = 0
         private var glRenderer: VideoGlRenderer? = null
         private val drawLock = Any()
 
@@ -86,6 +109,8 @@ class SkyLiveWallpaperService : WallpaperService() {
                 return glRenderer
             }
             if (surfaceHolder.surface?.isValid != true) return null
+            glRenderer?.release()
+            glRenderer = null
             val r = VideoGlRenderer(surfaceHolder, config)
             return if (r.initialize()) {
                 r.updateDimensions(surfaceWidth, surfaceHeight)
@@ -95,6 +120,19 @@ class SkyLiveWallpaperService : WallpaperService() {
                 r.release()
                 null
             }
+        }
+
+        private fun glForCanvas(): VideoGlRenderer? {
+            if (glFailed) return null
+            val existing = glRenderer
+            if (existing != null && existing.isInitialized) return existing
+            if (surfaceHolder.surface?.isValid != true) return null
+            val created = initGlRenderer()
+            if (created == null) {
+                Log.w(tag, "OpenGL unavailable, using plain canvas drawing for GIF / presets")
+                glFailed = true
+            }
+            return created
         }
 
         // GIF components (ImageDecoder-based for full frame fidelity & hardware memory management)
@@ -138,6 +176,16 @@ class SkyLiveWallpaperService : WallpaperService() {
         private val reusableAuroraPaths = Array(4) { Path() }
         private val matrixChars = "0123456789ABCDEF$#@*!?".toCharArray()
         private var lastVideoCheckTime = 0L
+
+        // GIF / preset frames are drawn on an offscreen bitmap and shown through the SAME OpenGL surface
+        // the video uses. A Surface can only be connected to ONE API at a time: once a Canvas has been
+        // locked on it, OpenGL/MediaPlayer can never attach to it again. Using GL for every wallpaper
+        // type is what lets you switch GIF -> video (and back) without the system re-creating the engine.
+        private var offscreenBitmap: Bitmap? = null
+        private var offscreenCanvas: Canvas? = null
+        private var drawOffsetX = 0f
+        private var drawOffsetY = 0f
+        private var glFailed = false
 
         // Parallax and touch
         private var xOffsetFrac = 0.5f
@@ -191,6 +239,12 @@ class SkyLiveWallpaperService : WallpaperService() {
                     if (mp == null) {
                         Log.w(tag, "Watchdog detected null mediaPlayer, restarting video")
                         startVideo()
+                    } else if (!playerPrepared) {
+                        // Still preparing: calling start() now would throw. Only restart if it is stuck.
+                        if (now - prepareStartTime > 10_000) {
+                            Log.w(tag, "Watchdog: video prepare is stuck, restarting")
+                            startVideo()
+                        }
                     } else {
                         val isPlaying = try { mp.isPlaying } catch (_: Exception) { false }
                         val currentPos = try { mp.currentPosition } catch (_: Exception) { -1 }
@@ -253,6 +307,7 @@ class SkyLiveWallpaperService : WallpaperService() {
         override fun onDestroy() {
             super.onDestroy()
             activeEngines.remove(this)
+            handler.removeCallbacks(applyConfigRunnable)
             val prefs = getSharedPreferences("sky_live_wallpaper_prefs", Context.MODE_PRIVATE)
             prefs.unregisterOnSharedPreferenceChangeListener(this)
             stopAll()
@@ -262,10 +317,7 @@ class SkyLiveWallpaperService : WallpaperService() {
 
         override fun onSharedPreferenceChanged(sharedPreferences: SharedPreferences?, key: String?) {
             if (key == "active_live_config") {
-                handler.post {
-                    loadConfig()
-                    restartEngine()
-                }
+                onWallpaperConfigChanged()
             }
         }
 
@@ -296,7 +348,7 @@ class SkyLiveWallpaperService : WallpaperService() {
         override fun onSurfaceCreated(holder: SurfaceHolder) {
             super.onSurfaceCreated(holder)
             holder.setFormat(PixelFormat.RGBA_8888)
-            // REMOVED: initGlRenderer() - Do not bind EGL blindly!
+            glFailed = false
             startMedia()
         }
 
@@ -317,6 +369,9 @@ class SkyLiveWallpaperService : WallpaperService() {
             stopAll()
             glRenderer?.release()
             glRenderer = null
+            offscreenCanvas = null
+            offscreenBitmap?.recycle()
+            offscreenBitmap = null
         }
 
         override fun onVisibilityChanged(visible: Boolean) {
@@ -326,8 +381,13 @@ class SkyLiveWallpaperService : WallpaperService() {
                 // Securely re-fetch the active SurfaceHolder and resume
                 val holder = surfaceHolder
                 if (holder?.surface?.isValid == true) {
-                    if (config.mediaType == LiveMediaType.VIDEO && !fallbackToPreset) {
-                        if (mediaPlayer == null) {
+                    if (config.mediaType == LiveMediaType.VIDEO) {
+                        if (fallbackToPreset) {
+                            // A previous attempt failed (surface not ready, etc.): try the real video again
+                            fallbackToPreset = false
+                            handler.removeCallbacks(loopRunnable)
+                            startVideo()
+                        } else if (mediaPlayer == null) {
                             startVideo()
                         } else {
                             resumeMedia()
@@ -377,12 +437,6 @@ class SkyLiveWallpaperService : WallpaperService() {
         private fun startMedia() {
             stopAll()
 
-            // Unbind OpenGL if we are switching to Canvas drawing
-            if (config.mediaType != LiveMediaType.VIDEO) {
-                glRenderer?.release()
-                glRenderer = null
-            }
-
             when (config.mediaType) {
                 LiveMediaType.VIDEO -> {
                     startVideo()
@@ -410,41 +464,65 @@ class SkyLiveWallpaperService : WallpaperService() {
             }
         }
 
+        /** Safely tears down the player. Never uses stop(), which throws while the player is still preparing. */
+        private fun releasePlayer() {
+            val mp = mediaPlayer
+            mediaPlayer = null
+            playerPrepared = false
+            if (mp == null) return
+            try {
+                mp.setOnPreparedListener(null)
+                mp.setOnErrorListener(null)
+                mp.setOnCompletionListener(null)
+                mp.setOnSeekCompleteListener(null)
+                mp.setOnVideoSizeChangedListener(null)
+            } catch (_: Exception) {}
+            try { mp.reset() } catch (_: Exception) {}
+            try { mp.release() } catch (_: Exception) {}
+        }
+
+        private fun fallBackToPreset() {
+            fallbackToPreset = true
+            startPreset()
+        }
+
         private fun startVideo() {
             val path = config.mediaPath
             if (path.isNullOrEmpty()) {
                 Log.w(tag, "Video path is null or empty, starting preset")
-                fallbackToPreset = true
-                glRenderer?.release()
-                glRenderer = null
-                startPreset()
+                releasePlayer()
+                fallBackToPreset()
                 return
             }
 
             val file = File(path)
             if (!file.exists() || file.length() == 0L) {
                 Log.w(tag, "Video file does not exist or is empty: $path, starting preset")
-                fallbackToPreset = true
-                glRenderer?.release()
-                glRenderer = null
-                startPreset()
+                releasePlayer()
+                fallBackToPreset()
+                return
+            }
+
+            val holderSurface = surfaceHolder.surface
+            if (holderSurface == null || !holderSurface.isValid) {
+                // Surface not ready yet. Do NOT fall back to the preset: onSurfaceCreated /
+                // onVisibilityChanged will call us again once it is.
+                Log.w(tag, "Surface not ready for video yet, waiting")
                 return
             }
 
             fallbackToPreset = false
+            releasePlayer()
 
+            // Prefer the GL renderer (crop / rotate / filters). If GL is unavailable on this device,
+            // play straight onto the wallpaper surface instead of showing the Aurora preset.
             val renderer = initGlRenderer()
-            if (renderer == null || renderer.videoSurface == null) {
-                Log.e(tag, "Failed to initialize VideoGlRenderer for video playback")
-                fallbackToPreset = true
-                glRenderer?.release()
-                glRenderer = null
-                startPreset()
-                return
+            val targetSurface: Surface? = renderer?.videoSurface ?: holderSurface
+            if (renderer == null) {
+                Log.w(tag, "VideoGlRenderer unavailable, playing video directly on the wallpaper surface")
             }
-
-            renderer.updateConfig(config)
-            renderer.updateDimensions(surfaceWidth, surfaceHeight)
+            renderer?.updateConfig(config)
+            renderer?.updateDimensions(surfaceWidth, surfaceHeight)
 
             // Extract metadata rotation and dimensions
             var videoRotation = 0
@@ -453,105 +531,126 @@ class SkyLiveWallpaperService : WallpaperService() {
             try {
                 val fisMeta = java.io.FileInputStream(file)
                 val retriever = MediaMetadataRetriever()
-                retriever.setDataSource(fisMeta.fd)
-                fisMeta.close()
-                videoRotation = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
-                rawVideoW = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 1080
-                rawVideoH = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 1920
-                retriever.release()
+                try {
+                    retriever.setDataSource(fisMeta.fd)
+                    videoRotation = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
+                    rawVideoW = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 1080
+                    rawVideoH = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 1920
+                } finally {
+                    try { retriever.release() } catch (_: Exception) {}
+                    try { fisMeta.close() } catch (_: Exception) {}
+                }
             } catch (e: Exception) {
                 Log.w(tag, "Failed extracting video metadata: ${e.message}")
             }
-            renderer.setVideoSize(rawVideoW, rawVideoH, videoRotation)
+            renderer?.setVideoSize(rawVideoW, rawVideoH, videoRotation)
 
             try {
-                mediaPlayer?.stop()
-                mediaPlayer?.reset()
-                mediaPlayer?.release()
-                mediaPlayer = null
-
+                val player = MediaPlayer()
                 val fis = java.io.FileInputStream(file)
-                val player = MediaPlayer().apply {
-                    setDataSource(fis.fd)
-                    fis.close()
-                    isLooping = true
-                    setSurface(renderer.videoSurface)
+                try {
+                    player.setDataSource(fis.fd)
+                } finally {
+                    try { fis.close() } catch (_: Exception) {}
+                }
+                player.isLooping = true
+                player.setSurface(targetSurface)
 
-                    val vol = if (config.isMuted) 0f else 0.5f
-                    setVolume(vol, vol)
+                val vol = if (config.isMuted) 0f else 0.5f
+                player.setVolume(vol, vol)
 
-                    setOnVideoSizeChangedListener { _, width, height ->
-                        if (width > 0 && height > 0) {
-                            rawVideoW = width
-                            rawVideoH = height
-                            renderer.setVideoSize(width, height, videoRotation)
-                        }
+                player.setOnVideoSizeChangedListener { mp, width, height ->
+                    if (mediaPlayer === mp && width > 0 && height > 0) {
+                        renderer?.setVideoSize(width, height, videoRotation)
                     }
+                }
 
-                    setOnCompletionListener { mp ->
-                        try {
-                            mp.seekTo(0)
-                            mp.start()
-                            renderer.requestRender(force = true)
-                        } catch (_: Exception) {
-                            startVideo()
-                        }
+                player.setOnCompletionListener { mp ->
+                    if (mediaPlayer !== mp) return@setOnCompletionListener
+                    try {
+                        mp.seekTo(0)
+                        mp.start()
+                        renderer?.requestRender(force = true)
+                    } catch (_: Exception) {
+                        startVideo()
                     }
+                }
 
-                    setOnSeekCompleteListener { mp ->
+                player.setOnSeekCompleteListener { mp ->
+                    if (mediaPlayer !== mp || !playerPrepared) return@setOnSeekCompleteListener
+                    try {
+                        if (!mp.isPlaying) mp.start()
+                        renderer?.requestRender(force = true)
+                    } catch (_: Exception) {}
+                }
+
+                player.setOnPreparedListener { mp ->
+                    if (mediaPlayer !== mp) return@setOnPreparedListener
+                    playerPrepared = true
+                    videoErrorCount = 0
+                    if (mp.videoWidth > 0 && mp.videoHeight > 0) {
+                        renderer?.setVideoSize(mp.videoWidth, mp.videoHeight, videoRotation)
+                    }
+                    // Only set PlaybackParams when speed differs from normal (1.0x).
+                    // Calling playbackParams on 1.0x on muted/silent videos causes NuPlayer
+                    // to fall back to software MediaSync clock resulting in severe slow-motion.
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && kotlin.math.abs(config.playbackSpeed - 1.0f) >= 0.05f) {
                         try {
-                            if (!mp.isPlaying) mp.start()
-                            renderer.requestRender(force = true)
+                            val params = PlaybackParams().apply {
+                                speed = config.playbackSpeed
+                                pitch = 1.0f
+                                audioFallbackMode = PlaybackParams.AUDIO_FALLBACK_MODE_MUTE
+                            }
+                            mp.playbackParams = params
                         } catch (_: Exception) {}
                     }
-
-                    setOnPreparedListener { mp ->
-                        if (mp.videoWidth > 0 && mp.videoHeight > 0) {
-                            rawVideoW = mp.videoWidth
-                            rawVideoH = mp.videoHeight
-                            renderer.setVideoSize(mp.videoWidth, mp.videoHeight, videoRotation)
-                        }
-                        // Only set PlaybackParams when speed differs from normal (1.0x).
-                        // Calling playbackParams on 1.0x on muted/silent videos causes NuPlayer
-                        // to fall back to software MediaSync clock resulting in severe slow-motion.
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && kotlin.math.abs(config.playbackSpeed - 1.0f) >= 0.05f) {
-                            try {
-                                val params = PlaybackParams().apply {
-                                    speed = config.playbackSpeed
-                                    pitch = 1.0f
-                                    audioFallbackMode = PlaybackParams.AUDIO_FALLBACK_MODE_MUTE
-                                }
-                                mp.playbackParams = params
-                            } catch (_: Exception) {}
-                        }
-                        try {
-                            mp.start()
-                            renderer.requestRender(force = true)
-                        } catch (e: Exception) {
-                            Log.e(tag, "mp.start error: ${e.message}")
-                        }
-                        startVideoWatchdog()
+                    try {
+                        mp.start()
+                        renderer?.requestRender(force = true)
+                    } catch (e: Exception) {
+                        Log.e(tag, "mp.start error: ${e.message}")
                     }
-
-                    setOnErrorListener { _, what, extra ->
-                        Log.e(tag, "MediaPlayer error: what=$what, extra=$extra")
-                        handler.postDelayed({
-                            if (config.mediaType == LiveMediaType.VIDEO && !fallbackToPreset) {
-                                startVideo()
-                            }
-                        }, 600)
-                        true
-                    }
-
-                    prepareAsync()
+                    startVideoWatchdog()
                 }
+
+                player.setOnErrorListener { mp, what, extra ->
+                    Log.e(tag, "MediaPlayer error: what=$what, extra=$extra")
+                    if (mediaPlayer === mp) {
+                        releasePlayer()
+                        videoErrorCount++
+                        if (videoErrorCount > 3) {
+                            // Genuinely undecodable video: only now use the preset
+                            fallBackToPreset()
+                        } else {
+                            handler.postDelayed({
+                                if (config.mediaType == LiveMediaType.VIDEO && !fallbackToPreset &&
+                                    isVisibleState && mediaPlayer == null) {
+                                    startVideo()
+                                }
+                            }, 600)
+                        }
+                    }
+                    true
+                }
+
                 mediaPlayer = player
+                playerPrepared = false
+                prepareStartTime = SystemClock.uptimeMillis()
+                player.prepareAsync()
             } catch (e: Exception) {
                 Log.e(tag, "Error setting up MediaPlayer: ${e.message}", e)
-                fallbackToPreset = true
-                glRenderer?.release()
-                glRenderer = null
-                startPreset()
+                releasePlayer()
+                videoErrorCount++
+                if (videoErrorCount > 3) {
+                    fallBackToPreset()
+                } else {
+                    handler.postDelayed({
+                        if (config.mediaType == LiveMediaType.VIDEO && !fallbackToPreset &&
+                            isVisibleState && mediaPlayer == null) {
+                            startVideo()
+                        }
+                    }, 600)
+                }
             }
         }
 
@@ -582,7 +681,7 @@ class SkyLiveWallpaperService : WallpaperService() {
                         val source = ImageDecoder.createSource(file)
                         val drawable = ImageDecoder.decodeDrawable(source) { decoder, info, _ ->
                             // Use hardware-backed graphic buffers for maximum fidelity and memory efficiency
-                            decoder.allocator = ImageDecoder.ALLOCATOR_DEFAULT
+                            decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
                             decoder.isMutableRequired = false
                             try {
                                 decoder.setTargetColorSpace(ColorSpace.get(ColorSpace.Named.SRGB))
@@ -642,7 +741,7 @@ class SkyLiveWallpaperService : WallpaperService() {
                     try {
                         val source = ImageDecoder.createSource(file)
                         fallbackBitmap = ImageDecoder.decodeBitmap(source) { decoder, _, _ ->
-                            decoder.allocator = ImageDecoder.ALLOCATOR_DEFAULT
+                            decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
                             decoder.isMutableRequired = false
                             try {
                                 decoder.setTargetColorSpace(ColorSpace.get(ColorSpace.Named.SRGB))
@@ -698,7 +797,7 @@ class SkyLiveWallpaperService : WallpaperService() {
             handler.removeCallbacks(loopRunnable)
             handler.removeCallbacks(videoWatchdogRunnable)
             try {
-                if (mediaPlayer?.isPlaying == true) {
+                if (playerPrepared && mediaPlayer?.isPlaying == true) {
                     mediaPlayer?.pause()
                 }
             } catch (_: Exception) {}
@@ -713,15 +812,18 @@ class SkyLiveWallpaperService : WallpaperService() {
             if (config.mediaType == LiveMediaType.VIDEO && !fallbackToPreset) {
                 try {
                     glRenderer?.ensureSurfaceValid()
-                    if (mediaPlayer == null) {
+                    val mp = mediaPlayer
+                    if (mp == null) {
                         startVideo()
-                    } else {
-                        if (!mediaPlayer!!.isPlaying) {
-                            mediaPlayer!!.start()
+                    } else if (playerPrepared) {
+                        if (!mp.isPlaying) {
+                            mp.start()
                         }
                         glRenderer?.requestRender(force = true)
                     }
-                } catch (_: Exception) {
+                    // else: still preparing. start() now would throw; onPrepared starts playback.
+                } catch (e: Exception) {
+                    Log.w(tag, "resumeMedia error: ${e.message}")
                     startVideo()
                 }
                 startVideoWatchdog()
@@ -745,12 +847,7 @@ class SkyLiveWallpaperService : WallpaperService() {
         private fun stopAll() {
             handler.removeCallbacks(loopRunnable)
             handler.removeCallbacks(videoWatchdogRunnable)
-            try {
-                mediaPlayer?.stop()
-                mediaPlayer?.reset()
-                mediaPlayer?.release()
-                mediaPlayer = null
-            } catch (_: Exception) {}
+            releasePlayer()
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && animatedDrawable is AnimatedImageDrawable) {
                 try {
@@ -774,7 +871,19 @@ class SkyLiveWallpaperService : WallpaperService() {
                     r.requestRender(force = true)
                     return
                 }
+                // Video is starting, or playing straight onto the surface. Never lock the canvas
+                // here (it fights the video surface) and never show the Aurora preset for a video.
+                return
             }
+
+            // GIF / presets: render through OpenGL so the surface is never tied to the Canvas API
+            val gl = glForCanvas()
+            if (gl != null) {
+                drawViaGl(gl)
+                return
+            }
+            drawOffsetX = config.offsetX
+            drawOffsetY = config.offsetY
 
             // Ensure thread-safe locking on the SurfaceHolder canvas when drawing
             synchronized(drawLock) {
@@ -798,17 +907,7 @@ class SkyLiveWallpaperService : WallpaperService() {
 
                     if (canvas != null) {
                         canvas.drawFilter = drawFilter
-                        if (fallbackToPreset) {
-                            drawAurora(canvas)
-                        } else {
-                            when (config.mediaType) {
-                                LiveMediaType.GIF -> drawGif(canvas)
-                                LiveMediaType.PRESET_AURORA -> drawAurora(canvas)
-                                LiveMediaType.PRESET_NEBULA -> drawNebula(canvas)
-                                LiveMediaType.PRESET_MATRIX -> drawMatrix(canvas)
-                                LiveMediaType.VIDEO -> drawAurora(canvas)
-                            }
-                        }
+                        drawContent(canvas)
                     }
                 } catch (e: Exception) {
                     Log.w(tag, "drawFrame canvas error: ${e.message}")
@@ -822,6 +921,53 @@ class SkyLiveWallpaperService : WallpaperService() {
                     }
                 }
             }
+        }
+
+        private fun drawContent(canvas: Canvas) {
+            if (fallbackToPreset) {
+                drawAurora(canvas)
+            } else {
+                when (config.mediaType) {
+                    LiveMediaType.GIF -> drawGif(canvas)
+                    LiveMediaType.PRESET_AURORA -> drawAurora(canvas)
+                    LiveMediaType.PRESET_NEBULA -> drawNebula(canvas)
+                    LiveMediaType.PRESET_MATRIX -> drawMatrix(canvas)
+                    LiveMediaType.VIDEO -> canvas.drawColor(Color.BLACK)
+                }
+            }
+        }
+
+        /** Draws the current GIF / preset frame on an offscreen bitmap and shows it via OpenGL. */
+        private fun drawViaGl(gl: VideoGlRenderer) {
+            // GIFs keep full resolution; the soft procedural presets render at half size (4x cheaper)
+            val scale = if (!fallbackToPreset && config.mediaType == LiveMediaType.GIF) 1f else 0.5f
+            val bw = (surfaceWidth * scale).toInt().coerceAtLeast(2)
+            val bh = (surfaceHeight * scale).toInt().coerceAtLeast(2)
+
+            var bmp = offscreenBitmap
+            if (bmp == null || bmp.isRecycled || bmp.width != bw || bmp.height != bh) {
+                bmp?.recycle()
+                bmp = try {
+                    Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888)
+                } catch (t: Throwable) {
+                    Log.e(tag, "Cannot allocate offscreen frame: ${t.message}")
+                    return
+                }
+                offscreenBitmap = bmp
+                offscreenCanvas = Canvas(bmp)
+            }
+            val canvas = offscreenCanvas ?: return
+
+            drawOffsetX = config.offsetX * scale
+            drawOffsetY = config.offsetY * scale
+            canvas.drawFilter = drawFilter
+            try {
+                drawContent(canvas)
+            } catch (e: Exception) {
+                Log.w(tag, "offscreen draw error: ${e.message}")
+                return
+            }
+            gl.renderBitmap(bmp)
         }
 
         private fun drawGif(canvas: Canvas) {
@@ -908,8 +1054,8 @@ class SkyLiveWallpaperService : WallpaperService() {
 
             val extraWidth = (canvasW - singlePageW).coerceAtLeast(0f)
             val parallaxShift = -extraWidth * (xOffsetFrac - 0.5f)
-            val centerX = Math.round((canvasW / 2f) + parallaxShift + config.offsetX).toFloat()
-            val centerY = Math.round((canvasH / 2f) + config.offsetY).toFloat()
+            val centerX = Math.round((canvasW / 2f) + parallaxShift + drawOffsetX).toFloat()
+            val centerY = Math.round((canvasH / 2f) + drawOffsetY).toFloat()
 
             canvas.save()
             canvas.translate(centerX, centerY)
@@ -967,8 +1113,8 @@ class SkyLiveWallpaperService : WallpaperService() {
 
             val extraWidth = (canvasW - physicalW).coerceAtLeast(0f)
             val parallaxShift = -extraWidth * (xOffsetFrac - 0.5f)
-            val centerX = (canvasW / 2f) + parallaxShift + config.offsetX
-            val centerY = (canvasH / 2f) + config.offsetY
+            val centerX = (canvasW / 2f) + parallaxShift + drawOffsetX
+            val centerY = (canvasH / 2f) + drawOffsetY
 
             canvas.translate(centerX, centerY)
             val userScale = config.scaleFactor.coerceIn(0.2f, 5.0f)
@@ -1046,8 +1192,8 @@ class SkyLiveWallpaperService : WallpaperService() {
 
             val extraWidth = (canvasW - physicalW).coerceAtLeast(0f)
             val parallaxShift = -extraWidth * (xOffsetFrac - 0.5f)
-            val centerX = (canvasW / 2f) + parallaxShift + config.offsetX
-            val centerY = (canvasH / 2f) + config.offsetY
+            val centerX = (canvasW / 2f) + parallaxShift + drawOffsetX
+            val centerY = (canvasH / 2f) + drawOffsetY
 
             canvas.translate(centerX, centerY)
             val userScale = config.scaleFactor.coerceIn(0.2f, 5.0f)
@@ -1098,8 +1244,8 @@ class SkyLiveWallpaperService : WallpaperService() {
 
             val extraWidth = (canvasW - physicalW).coerceAtLeast(0f)
             val parallaxShift = -extraWidth * (xOffsetFrac - 0.5f)
-            val centerX = (canvasW / 2f) + parallaxShift + config.offsetX
-            val centerY = (canvasH / 2f) + config.offsetY
+            val centerX = (canvasW / 2f) + parallaxShift + drawOffsetX
+            val centerY = (canvasH / 2f) + drawOffsetY
 
             canvas.translate(centerX, centerY)
             val userScale = config.scaleFactor.coerceIn(0.2f, 5.0f)

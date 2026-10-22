@@ -38,6 +38,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.RotateRight
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -58,6 +59,8 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -70,6 +73,8 @@ import coil.decode.ImageDecoderDecoder
 import coil.request.ImageRequest
 import com.example.service.wallpaper.*
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -81,7 +86,10 @@ import kotlin.math.sin
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun LiveWallpaperTab(
-    onBack: (() -> Unit)? = null
+    onBack: (() -> Unit)? = null,
+    // Room to leave at the top when another header (the Static/Live switcher) floats over this screen
+    topContentPadding: Dp = 0.dp,
+    onFullscreenChange: ((Boolean) -> Unit)? = null
 ) {
     if (onBack != null) {
         BackHandler(onBack = onBack)
@@ -89,15 +97,79 @@ fun LiveWallpaperTab(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
-    var activeConfig by remember { mutableStateOf(LiveWallpaperManager.getActiveConfig(context)) }
+    // The wallpaper being previewed survives the activity being re-created (lock / unlock)
+    var previewId by rememberSaveable { mutableStateOf<String?>(null) }
+    var activeConfig by remember {
+        mutableStateOf(
+            previewId?.let { id -> LiveWallpaperManager.getSavedList(context).firstOrNull { it.id == id } }
+                ?: LiveWallpaperManager.getActiveConfig(context)
+        )
+    }
+    LaunchedEffect(activeConfig.id) { previewId = activeConfig.id }
     var savedList by remember { mutableStateOf(LiveWallpaperManager.getSavedList(context)) }
     var systemWallpapers by remember { mutableStateOf<List<SystemLiveWallpaperInfo>>(emptyList()) }
     var isLoadingSystem by remember { mutableStateOf(true) }
     var showFullscreenPreview by remember { mutableStateOf(false) }
     var croppingConfig by remember { mutableStateOf<LiveWallpaperConfig?>(null) }
 
-    var selectedEditTab by remember { mutableIntStateOf(0) }
-    val editTabs = listOf("Wallpapers & Presets", "Auto Change", "Edit & Crop", "Color Filters")
+    LaunchedEffect(showFullscreenPreview, croppingConfig) {
+        onFullscreenChange?.invoke(showFullscreenPreview || croppingConfig != null)
+    }
+
+    // Id of the wallpaper that is really set on the phone (the screen can show a different one as a preview)
+    var appliedId by remember { mutableStateOf(LiveWallpaperManager.getActiveConfig(context).id) }
+
+    // Puts [cfg] on the phone. This is the only place a wallpaper gets applied.
+    fun applyConfigNow(cfg: LiveWallpaperConfig) {
+        activeConfig = cfg
+        LiveWallpaperManager.saveActiveConfig(context, cfg)
+        savedList = LiveWallpaperManager.getSavedList(context)
+        appliedId = cfg.id
+        LiveWallpaperManager.applyLiveWallpaper(context)
+    }
+
+    // Edits (rotate / crop / filter ...) are remembered in the list. They only change the phone's
+    // wallpaper live when this is the wallpaper that is currently applied.
+    fun persistEdit(edited: LiveWallpaperConfig) {
+        val applied = LiveWallpaperManager.getActiveConfig(context)
+        val isApplied = applied.id == edited.id ||
+            (applied.mediaPath != null && applied.mediaPath == edited.mediaPath)
+        if (isApplied) {
+            LiveWallpaperManager.saveActiveConfig(context, edited)
+            appliedId = edited.id
+        } else {
+            LiveWallpaperManager.addToSavedList(context, edited)
+        }
+        savedList = LiveWallpaperManager.getSavedList(context)
+    }
+
+    // Edit panel changes show up in the preview straight away, but are written to storage (and sent to
+    // the phone when this wallpaper is the applied one) only once the user pauses. Dragging the blur
+    // slider used to save + restart the live wallpaper on every single step, which made the screen stutter.
+    var pendingEdit by remember { mutableStateOf<LiveWallpaperConfig?>(null) }
+    var persistJob by remember { mutableStateOf<Job?>(null) }
+    fun editWallpaper(updated: LiveWallpaperConfig) {
+        activeConfig = updated
+        pendingEdit = updated
+        persistJob?.cancel()
+        persistJob = scope.launch {
+            delay(250)
+            pendingEdit?.let { persistEdit(it) }
+            pendingEdit = null
+        }
+    }
+    DisposableEffect(Unit) {
+        onDispose { pendingEdit?.let { persistEdit(it) } }
+    }
+
+    // Asking the system which wallpaper is set is a slow call: do it off the main thread, only when it can change
+    var ourLiveActive by remember { mutableStateOf(false) }
+    LaunchedEffect(appliedId) {
+        ourLiveActive = withContext(Dispatchers.IO) { LiveWallpaperManager.isOurLiveWallpaperActive(context) }
+    }
+
+    var selectedEditTab by rememberSaveable { mutableStateOf(0) }
+    val editTabs = listOf("Wallpapers & Presets", "Auto Change")
 
     val colorMatrixArray = remember(activeConfig.colorFilter) {
         LiveWallpaperManager.getColorMatrix(activeConfig.colorFilter)
@@ -156,9 +228,9 @@ fun LiveWallpaperTab(
                         dateAdded = System.currentTimeMillis()
                     )
                     activeConfig = updated
-                    LiveWallpaperManager.saveActiveConfig(context, updated)
+                    LiveWallpaperManager.addToSavedList(context, updated)
                     savedList = LiveWallpaperManager.getSavedList(context)
-                    Toast.makeText(context, "$namePrefix imported successfully!", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "$namePrefix added. Tap the apply icon to use it.", Toast.LENGTH_SHORT).show()
                 } else {
                     Toast.makeText(context, "Failed to import media file", Toast.LENGTH_SHORT).show()
                 }
@@ -191,9 +263,9 @@ fun LiveWallpaperTab(
                         dateAdded = System.currentTimeMillis()
                     )
                     activeConfig = updated
-                    LiveWallpaperManager.saveActiveConfig(context, updated)
+                    LiveWallpaperManager.addToSavedList(context, updated)
                     savedList = LiveWallpaperManager.getSavedList(context)
-                    Toast.makeText(context, "$namePrefix imported successfully!", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "$namePrefix added. Tap the apply icon to use it.", Toast.LENGTH_SHORT).show()
                 } else {
                     Toast.makeText(context, "Failed to import media file", Toast.LENGTH_SHORT).show()
                 }
@@ -207,7 +279,10 @@ fun LiveWallpaperTab(
             .testTag("live_wallpaper_screen")
     ) {
         // --- 1. FULLSCREEN REAL-TIME LIVE WALLPAPER BACKGROUND PREVIEW ---
-        Box(modifier = Modifier.fillMaxSize()) {
+        // Own graphics layer: every animation frame only redraws THIS layer. Without it each frame
+        // re-recorded the whole screen (all the cards of the list), which is what made scrolling lag.
+        val previewAnimating = croppingConfig == null && !showFullscreenPreview
+        Box(modifier = Modifier.fillMaxSize().graphicsLayer { }) {
             when (activeConfig.mediaType) {
                 LiveMediaType.VIDEO -> {
                     val path = activeConfig.mediaPath
@@ -237,6 +312,7 @@ fun LiveWallpaperTab(
                         PresetCanvasPreview(
                             presetType = LiveMediaType.PRESET_AURORA,
                             colorMatrixArray = colorMatrixArray,
+                            animate = previewAnimating,
                             modifier = Modifier.fillMaxSize()
                         )
                     }
@@ -271,6 +347,7 @@ fun LiveWallpaperTab(
                         PresetCanvasPreview(
                             presetType = LiveMediaType.PRESET_AURORA,
                             colorMatrixArray = colorMatrixArray,
+                            animate = previewAnimating,
                             modifier = Modifier.fillMaxSize()
                         )
                     }
@@ -281,6 +358,7 @@ fun LiveWallpaperTab(
                     PresetCanvasPreview(
                         presetType = activeConfig.mediaType,
                         colorMatrixArray = colorMatrixArray,
+                        animate = previewAnimating,
                         modifier = Modifier.fillMaxSize()
                     )
                 }
@@ -291,6 +369,7 @@ fun LiveWallpaperTab(
         Box(
             modifier = Modifier
                 .fillMaxSize()
+                .graphicsLayer { }
                 .background(
                     Brush.verticalGradient(
                         colors = listOf(
@@ -307,6 +386,7 @@ fun LiveWallpaperTab(
             modifier = Modifier
                 .fillMaxSize()
                 .statusBarsPadding()
+                .padding(top = topContentPadding)
         ) {
             // Glass Top Navigation Header
             Surface(
@@ -348,9 +428,7 @@ fun LiveWallpaperTab(
                                 fontSize = 15.sp,
                                 color = Color.White
                             )
-                            val isOurLiveActive = remember(activeConfig) {
-                                LiveWallpaperManager.isOurLiveWallpaperActive(context)
-                            }
+                            val isOurLiveActive = ourLiveActive && appliedId == activeConfig.id
                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                                 Box(
                                     modifier = Modifier
@@ -388,8 +466,7 @@ fun LiveWallpaperTab(
 
                         Button(
                             onClick = {
-                                LiveWallpaperManager.saveActiveConfig(context, activeConfig)
-                                LiveWallpaperManager.applyLiveWallpaper(context)
+                                applyConfigNow(activeConfig)
                             },
                             shape = RoundedCornerShape(12.dp),
                             contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
@@ -410,35 +487,57 @@ fun LiveWallpaperTab(
                     verticalArrangement = Arrangement.spacedBy(14.dp),
                     contentPadding = PaddingValues(bottom = 32.dp, top = 6.dp)
                 ) {
-                    // Category Tab Row (90% transparent glass)
+                    // Category Tab Pills (Equal-width, no right blank space)
                     item {
                         Surface(
                             modifier = Modifier.fillMaxWidth(),
-                            shape = RoundedCornerShape(16.dp),
-                            color = Color.Black.copy(alpha = 0.35f),
-                            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.20f))
+                            shape = CircleShape,
+                            color = Color.Black.copy(alpha = 0.45f),
+                            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.22f))
                         ) {
-                            PrimaryScrollableTabRow(
-                                selectedTabIndex = selectedEditTab,
-                                edgePadding = 4.dp,
-                                containerColor = Color.Transparent,
-                                contentColor = Color.White,
-                                divider = {}
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(4.dp),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
                                 editTabs.forEachIndexed { index, title ->
-                                    Tab(
-                                        selected = selectedEditTab == index,
+                                    val isSelected = selectedEditTab == index
+                                    Surface(
                                         onClick = { selectedEditTab = index },
-                                        text = {
-                                            Text(
-                                                title,
-                                                fontWeight = if (selectedEditTab == index) FontWeight.Bold else FontWeight.Medium,
-                                                fontSize = 12.sp,
-                                                color = if (selectedEditTab == index) Color(0xFF64B5F6) else Color.White.copy(alpha = 0.75f)
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .testTag("live_tab_$index"),
+                                        shape = CircleShape,
+                                        color = if (isSelected) Color(0xFF1976D2) else Color.Transparent,
+                                        contentColor = Color.White
+                                    ) {
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(vertical = 10.dp, horizontal = 10.dp),
+                                            horizontalArrangement = Arrangement.Center,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            val icon = if (index == 0) Icons.Default.AutoAwesome else Icons.Default.Schedule
+                                            Icon(
+                                                imageVector = icon,
+                                                contentDescription = null,
+                                                modifier = Modifier.size(16.dp),
+                                                tint = if (isSelected) Color.White else Color.White.copy(alpha = 0.70f)
                                             )
-                                        },
-                                        modifier = Modifier.testTag("live_tab_$index")
-                                    )
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Text(
+                                                text = title,
+                                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                                                fontSize = 12.5.sp,
+                                                color = if (isSelected) Color.White else Color.White.copy(alpha = 0.75f),
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -448,6 +547,7 @@ fun LiveWallpaperTab(
                     when (selectedEditTab) {
                         0 -> {
                             // Wallpapers & Presets: Unified 3 Defaults + System Wallpapers + Custom Media
+                            item { PauseWallpapersCard() }
                             item {
                                 UnifiedWallpapersCard(
                                     config = activeConfig,
@@ -462,9 +562,7 @@ fun LiveWallpaperTab(
                                             dateAdded = System.currentTimeMillis()
                                         )
                                         activeConfig = updated
-                                        LiveWallpaperManager.saveActiveConfig(context, updated)
-                                        savedList = LiveWallpaperManager.getSavedList(context)
-                                        Toast.makeText(context, "$presetTitle selected!", Toast.LENGTH_SHORT).show()
+                                        Toast.makeText(context, "$presetTitle preview. Tap Apply to use it.", Toast.LENGTH_SHORT).show()
                                     },
                                     onApplySystem = { wp ->
                                         LiveWallpaperManager.applyLiveWallpaper(
@@ -488,29 +586,19 @@ fun LiveWallpaperTab(
                                     },
                                     savedList = savedList,
                                     onSelectSaved = { saved ->
+                                        // Tapping only previews. The apply icon puts it on the phone.
                                         activeConfig = saved
-                                        LiveWallpaperManager.saveActiveConfig(context, saved)
-                                        LiveWallpaperManager.applyLiveWallpaper(context)
                                     },
+                                    onApplySaved = { saved -> applyConfigNow(saved) },
                                     onDeleteSaved = { savedId ->
                                         LiveWallpaperManager.removeFromSavedList(context, savedId)
                                         savedList = LiveWallpaperManager.getSavedList(context)
                                         Toast.makeText(context, "Wallpaper removed", Toast.LENGTH_SHORT).show()
                                     },
-                                    onRotate = { item ->
-                                        val newRot = (item.rotationDegrees + 90) % 360
-                                        val updated = item.copy(rotationDegrees = newRot)
-                                        LiveWallpaperManager.addToSavedList(context, updated)
-                                        if (activeConfig.id == updated.id || (activeConfig.mediaPath != null && activeConfig.mediaPath == updated.mediaPath)) {
-                                            activeConfig = updated
-                                            LiveWallpaperManager.saveActiveConfig(context, updated)
-                                        }
-                                        savedList = LiveWallpaperManager.getSavedList(context)
-                                        Toast.makeText(context, "Rotated to ${newRot}°", Toast.LENGTH_SHORT).show()
-                                    },
                                     onCrop = { item ->
                                         croppingConfig = item
-                                    }
+                                    },
+                                    onEditItem = { updated -> editWallpaper(updated) }
                                 )
                             }
                         }
@@ -521,34 +609,7 @@ fun LiveWallpaperTab(
                                     context = context,
                                     onActiveConfigChanged = { updated ->
                                         activeConfig = updated
-                                    }
-                                )
-                            }
-                        }
-                        2 -> {
-                            // Edit & Crop
-                            item {
-                                EditAndCropCard(
-                                    config = activeConfig,
-                                    onConfigChange = { updated ->
-                                        activeConfig = updated
-                                        LiveWallpaperManager.saveActiveConfig(context, updated)
-                                    },
-                                    onOpenFullscreenCrop = {
-                                        croppingConfig = activeConfig
-                                    }
-                                )
-                            }
-                        }
-                        3 -> {
-                            // Color Filters
-                            item {
-                                ColorFiltersCard(
-                                    config = activeConfig,
-                                    onFilterSelect = { filter ->
-                                        val updated = activeConfig.copy(colorFilter = filter)
-                                        activeConfig = updated
-                                        LiveWallpaperManager.saveActiveConfig(context, updated)
+                                        appliedId = updated.id
                                     }
                                 )
                             }
@@ -559,8 +620,7 @@ fun LiveWallpaperTab(
                     item {
                         Button(
                             onClick = {
-                                LiveWallpaperManager.saveActiveConfig(context, activeConfig)
-                                LiveWallpaperManager.applyLiveWallpaper(context)
+                                applyConfigNow(activeConfig)
                             },
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -587,7 +647,7 @@ fun LiveWallpaperTab(
                     LiveWallpaperManager.addToSavedList(context, updated)
                     if (activeConfig.id == updated.id || (activeConfig.mediaPath != null && activeConfig.mediaPath == updated.mediaPath)) {
                         activeConfig = updated
-                        LiveWallpaperManager.saveActiveConfig(context, updated)
+                        persistEdit(updated)
                     }
                     savedList = LiveWallpaperManager.getSavedList(context)
                     croppingConfig = null
@@ -602,9 +662,7 @@ fun LiveWallpaperTab(
                 imageLoader = gifImageLoader,
                 onDismiss = { showFullscreenPreview = false },
                 onApply = { updatedConfig ->
-                    activeConfig = updatedConfig
-                    LiveWallpaperManager.saveActiveConfig(context, updatedConfig)
-                    LiveWallpaperManager.applyLiveWallpaper(context)
+                    applyConfigNow(updatedConfig)
                     showFullscreenPreview = false
                     Toast.makeText(context, "Tap 'Set Wallpaper' to confirm!", Toast.LENGTH_SHORT).show()
                 }
@@ -1033,13 +1091,16 @@ fun VideoTexturePreview(
 fun PresetCanvasPreview(
     presetType: LiveMediaType,
     colorMatrixArray: FloatArray,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    // false while the preview is hidden behind a fullscreen screen: no frames are produced at all
+    animate: Boolean = true
 ) {
     var tick by remember { mutableFloatStateOf(0f) }
 
     // Throttled to ~30fps (time-based so the speed is unchanged); halves the GPU/CPU work
     // that was competing with scrolling and popups.
-    LaunchedEffect(Unit) {
+    LaunchedEffect(animate) {
+        if (!animate) return@LaunchedEffect
         var last = 0L
         while (true) {
             withFrameNanos { now ->
@@ -1053,7 +1114,8 @@ fun PresetCanvasPreview(
         }
     }
 
-    androidx.compose.foundation.Canvas(modifier = modifier) {
+    // graphicsLayer: the animation redraws only this canvas, never the rest of the screen
+    androidx.compose.foundation.Canvas(modifier = modifier.graphicsLayer { }) {
         val w = size.width
         val h = size.height
 
@@ -1142,20 +1204,53 @@ fun PresetCanvasPreview(
 }
 
 /**
- * Tab 1: Edit & Crop (Rotation, Crop Mode, Playback Speed, Mute)
+ * The edit panels sit on dark glass. With a light system theme their theme-colored texts would be dark on
+ * dark, so inside a panel we always use the dark color scheme.
+ */
+@Composable
+fun ForceDarkPanel(content: @Composable () -> Unit) {
+    val isLightTheme = MaterialTheme.colorScheme.surface.luminance() > 0.5f
+    if (isLightTheme) {
+        MaterialTheme(
+            colorScheme = darkColorScheme(),
+            typography = MaterialTheme.typography,
+            shapes = MaterialTheme.shapes,
+            content = content
+        )
+    } else {
+        content()
+    }
+}
+
+/** Card frame for the edit panels, or nothing at all when they sit inside another panel. */
+@Composable
+private fun LiveEditShell(embedded: Boolean, tag: String, content: @Composable () -> Unit) {
+    if (embedded) {
+        Box(modifier = Modifier.fillMaxWidth().testTag(tag)) { content() }
+    } else {
+        Card(
+            modifier = Modifier.fillMaxWidth().testTag(tag),
+            shape = RoundedCornerShape(20.dp),
+            colors = CardDefaults.cardColors(containerColor = Color.Black.copy(alpha = 0.35f)),
+            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.22f))
+        ) { content() }
+    }
+}
+
+/**
+ * Edit & Crop (Rotation, Crop Mode, Playback Speed, Blur, Mute)
  */
 @Composable
 fun EditAndCropCard(
     config: LiveWallpaperConfig,
     onConfigChange: (LiveWallpaperConfig) -> Unit,
-    onOpenFullscreenCrop: (() -> Unit)? = null
+    onOpenFullscreenCrop: (() -> Unit)? = null,
+    // true: drawn inside another panel (no card of its own). false: stand-alone card.
+    embedded: Boolean = false,
+    // Playback speed only makes sense for videos / GIFs, not for still pictures
+    showPlayback: Boolean = true
 ) {
-    Card(
-        modifier = Modifier.fillMaxWidth().testTag("card_live_edit_crop"),
-        shape = RoundedCornerShape(20.dp),
-        colors = CardDefaults.cardColors(containerColor = Color.Black.copy(alpha = 0.35f)),
-        border = BorderStroke(1.dp, Color.White.copy(alpha = 0.22f))
-    ) {
+    LiveEditShell(embedded = embedded, tag = "card_live_edit_crop") {
         Column(modifier = Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
             if (onOpenFullscreenCrop != null) {
                 Button(
@@ -1263,6 +1358,7 @@ fun EditAndCropCard(
 
             HorizontalDivider()
 
+            if (showPlayback) {
             // Playback Speed Section
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1299,6 +1395,7 @@ fun EditAndCropCard(
             }
 
             HorizontalDivider()
+            }
 
             // Blur Effect Section
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1385,14 +1482,10 @@ fun EditAndCropCard(
 @Composable
 fun ColorFiltersCard(
     config: LiveWallpaperConfig,
-    onFilterSelect: (LiveColorFilter) -> Unit
+    onFilterSelect: (LiveColorFilter) -> Unit,
+    embedded: Boolean = false
 ) {
-    Card(
-        modifier = Modifier.fillMaxWidth().testTag("card_live_color_filters"),
-        shape = RoundedCornerShape(20.dp),
-        colors = CardDefaults.cardColors(containerColor = Color.Black.copy(alpha = 0.35f)),
-        border = BorderStroke(1.dp, Color.White.copy(alpha = 0.22f))
-    ) {
+    LiveEditShell(embedded = embedded, tag = "card_live_color_filters") {
         Column(modifier = Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(Icons.Default.ColorLens, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
@@ -1691,9 +1784,11 @@ fun UnifiedWallpapersCard(
     onSelectSaved: (LiveWallpaperConfig) -> Unit,
     onDeleteSaved: (String) -> Unit,
     onRotate: ((LiveWallpaperConfig) -> Unit)? = null,
-    onCrop: ((LiveWallpaperConfig) -> Unit)? = null
+    onCrop: ((LiveWallpaperConfig) -> Unit)? = null,
+    onApplySaved: ((LiveWallpaperConfig) -> Unit)? = null,
+    onEditItem: ((LiveWallpaperConfig) -> Unit)? = null
 ) {
-    var expandedEditId by remember { mutableStateOf<String?>(null) }
+    var expandedEditId by rememberSaveable { mutableStateOf<String?>(null) }
 
     Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
         // 1. Unified Default Live Wallpapers & System Live Wallpapers Card
@@ -1953,6 +2048,7 @@ fun UnifiedWallpapersCard(
                     Text("My Saved Live Wallpapers (${savedList.size})", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = Color(0xFF90CAF9))
 
                     savedList.forEach { item ->
+                        key(item.id) {
                         val isSelected = config.id == item.id
                         Column(modifier = Modifier.fillMaxWidth()) {
                             Surface(
@@ -2002,15 +2098,32 @@ fun UnifiedWallpapersCard(
                                         if (isSelected) {
                                             Icon(
                                                 Icons.Default.CheckCircle,
-                                                contentDescription = "Active",
+                                                contentDescription = "Selected",
                                                 tint = Color(0xFF64B5F6),
                                                 modifier = Modifier.padding(end = 4.dp)
                                             )
                                         }
+                                        // Apply icon on every custom live wallpaper
+                                        if (onApplySaved != null) {
+                                            IconButton(
+                                                onClick = { onApplySaved(item) },
+                                                modifier = Modifier.size(34.dp).testTag("btn_apply_${item.id}")
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Default.Wallpaper,
+                                                    contentDescription = "Apply this live wallpaper",
+                                                    tint = Color(0xFF69F0AE),
+                                                    modifier = Modifier.size(20.dp)
+                                                )
+                                            }
+                                        }
                                         // Edit icon on every custom live wallpaper
                                         IconButton(
                                             onClick = {
-                                                expandedEditId = if (expandedEditId == item.id) null else item.id
+                                                val opening = expandedEditId != item.id
+                                                expandedEditId = if (opening) item.id else null
+                                                // Show this wallpaper in the preview so every change is visible right away
+                                                if (opening) onSelectSaved(item)
                                             },
                                             modifier = Modifier.size(34.dp).testTag("btn_edit_${item.id}")
                                         ) {
@@ -2036,7 +2149,8 @@ fun UnifiedWallpapersCard(
                                 }
                             }
 
-                            // Slide down options: Rotate option icon and Crop option icon
+                            // Slide down panel behind the edit icon: rotate, crop / pinch, crop mode,
+                            // blur, playback and color filters. Only composed for the one that is open.
                             AnimatedVisibility(
                                 visible = expandedEditId == item.id,
                                 enter = expandVertically() + fadeIn(),
@@ -2050,61 +2164,35 @@ fun UnifiedWallpapersCard(
                                     color = Color.Black.copy(alpha = 0.50f),
                                     border = BorderStroke(1.dp, Color(0xFF64B5F6).copy(alpha = 0.35f))
                                 ) {
-                                    Row(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .padding(horizontal = 12.dp, vertical = 8.dp),
-                                        horizontalArrangement = Arrangement.SpaceEvenly,
-                                        verticalAlignment = Alignment.CenterVertically
+                                    // The selected preview holds the newest values while a slider is moving
+                                    val editConfig = if (config.id == item.id) config else item
+                                    ForceDarkPanel {
+                                    Column(
+                                        modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                                        verticalArrangement = Arrangement.spacedBy(0.dp)
                                     ) {
-                                        // Rotate option icon
-                                        OutlinedButton(
-                                            onClick = { onRotate?.invoke(item) },
-                                            shape = RoundedCornerShape(10.dp),
-                                            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.25f)),
-                                            colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
-                                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
-                                        ) {
-                                            Icon(
-                                                imageVector = Icons.Default.RotateRight,
-                                                contentDescription = "Rotate",
-                                                tint = Color(0xFF81D4FA),
-                                                modifier = Modifier.size(18.dp)
-                                            )
-                                            Spacer(modifier = Modifier.width(6.dp))
-                                            Text(
-                                                "Rotate (${item.rotationDegrees}°)",
-                                                fontSize = 12.sp,
-                                                fontWeight = FontWeight.SemiBold
-                                            )
-                                        }
-
-                                        // Crop option icon
-                                        Button(
-                                            onClick = { onCrop?.invoke(item) },
-                                            shape = RoundedCornerShape(10.dp),
-                                            colors = ButtonDefaults.buttonColors(
-                                                containerColor = Color(0xFF1976D2),
-                                                contentColor = Color.White
-                                            ),
-                                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
-                                        ) {
-                                            Icon(
-                                                imageVector = Icons.Default.Crop,
-                                                contentDescription = "Crop",
-                                                tint = Color.White,
-                                                modifier = Modifier.size(18.dp)
-                                            )
-                                            Spacer(modifier = Modifier.width(6.dp))
-                                            Text(
-                                                "Crop / Pinch",
-                                                fontSize = 12.sp,
-                                                fontWeight = FontWeight.Bold
-                                            )
-                                        }
+                                        EditAndCropCard(
+                                            config = editConfig,
+                                            onConfigChange = { updated -> onEditItem?.invoke(updated) },
+                                            onOpenFullscreenCrop = { onCrop?.invoke(editConfig) },
+                                            embedded = true
+                                        )
+                                        HorizontalDivider(
+                                            color = Color.White.copy(alpha = 0.12f),
+                                            modifier = Modifier.padding(horizontal = 16.dp)
+                                        )
+                                        ColorFiltersCard(
+                                            config = editConfig,
+                                            onFilterSelect = { filter ->
+                                                onEditItem?.invoke(editConfig.copy(colorFilter = filter))
+                                            },
+                                            embedded = true
+                                        )
+                                    }
                                     }
                                 }
                             }
+                        }
                         }
                     }
                 }

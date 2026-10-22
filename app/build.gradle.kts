@@ -18,8 +18,8 @@ android {
     applicationId = "com.skytouch.sk"
     minSdk = 24
     targetSdk = 36
-    versionCode = 81
-    versionName = "8.1"
+    versionCode = 84
+    versionName = "8.4"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }

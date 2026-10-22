@@ -15,6 +15,7 @@ class LiveWallpaperWorker(
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         try {
+            if (DefaultWallpaperManager.isPaused(context)) return@withContext Result.success()
             if (!LiveWallpaperManager.isAutoChangeEnabled(context)) {
                 return@withContext Result.failure()
             }

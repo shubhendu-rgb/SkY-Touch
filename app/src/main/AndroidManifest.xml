@@ -186,6 +186,17 @@
         </service>
 
         <service
+            android:name=".service.tiles.WallpaperChangerToggleTileService"
+            android:icon="@drawable/ic_qs_wallpaper_changer"
+            android:label="Wallpaper Changer"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+        <service
             android:name=".service.tiles.LiveWallpaperTileService"
             android:icon="@drawable/ic_qs_live_wallpaper"
             android:label="Live Wallpaper"

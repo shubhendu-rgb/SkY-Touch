@@ -246,13 +246,35 @@ fun MainContentScreen(
         }
     }
 
+    var pendingUpdate by remember { mutableStateOf<com.example.util.UpdateInfo?>(null) }
+
+    val updateNotificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        // Post the update notification right after the user grants permission
+        if (granted) pendingUpdate?.let {
+            com.example.util.UpdateChecker.showUpdateNotification(context, it)
+        }
+    }
+
     // Periodically check service status
     LaunchedEffect(Unit) {
         launch {
             val info = com.example.util.UpdateChecker.checkForUpdates(context)
             if (info != null && info.isUpdateAvailable) {
                 updateInfo = info
-                com.example.util.UpdateChecker.showUpdateNotification(context, info)
+                pendingUpdate = info
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                    androidx.core.content.ContextCompat.checkSelfPermission(
+                        context, android.Manifest.permission.POST_NOTIFICATIONS
+                    ) != PackageManager.PERMISSION_GRANTED
+                ) {
+                    updateNotificationPermissionLauncher.launch(
+                        android.Manifest.permission.POST_NOTIFICATIONS
+                    )
+                } else {
+                    com.example.util.UpdateChecker.showUpdateNotification(context, info)
+                }
             }
         }
         
@@ -294,9 +316,11 @@ fun MainContentScreen(
             else -> ScreenType.DASHBOARD
         }
     }
-    var currentScreen by remember { mutableStateOf(initialScreen) }
-    var autoClickSubScreen by remember { mutableStateOf<AutoClickSubScreen?>(null) }
-    var editingActionGesture by remember { mutableStateOf<String?>(null) }
+    // rememberSaveable: Android re-creates the activity after the phone is locked / unlocked (and whenever the
+    // system theme colors change). Plain remember lost the open screen every time, so you landed on the Dashboard.
+    var currentScreen by rememberSaveable { mutableStateOf(initialScreen) }
+    var autoClickSubScreen by rememberSaveable { mutableStateOf<AutoClickSubScreen?>(null) }
+    var editingActionGesture by rememberSaveable { mutableStateOf<String?>(null) }
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val scope = rememberCoroutineScope()
 
@@ -372,7 +396,24 @@ fun MainContentScreen(
                 Column(
                     modifier = Modifier.fillMaxHeight().padding(24.dp)
                 ) {
-                    Text("SkY Touch", fontSize = 24.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text("SkY Touch", fontSize = 24.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+                        Surface(
+                            color = MaterialTheme.colorScheme.primaryContainer,
+                            shape = RoundedCornerShape(6.dp)
+                        ) {
+                            Text(
+                                text = "v8.4",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
+                    }
                     Spacer(modifier = Modifier.height(32.dp))
                     
                     Text("Theme", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.primary)
@@ -690,9 +731,16 @@ fun MainContentScreen(
             text = { Text("A new version (${updateInfo!!.version}) of the app is available. Would you like to download it from GitHub?") },
             confirmButton = {
                 Button(onClick = {
-                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(updateInfo!!.releaseUrl))
-                    context.startActivity(intent)
+                    val url = updateInfo!!.releaseUrl
                     updateInfo = null
+                    try {
+                        context.startActivity(
+                            Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        )
+                    } catch (e: Exception) {
+                        Toast.makeText(context, "No browser found to open the download page", Toast.LENGTH_LONG).show()
+                    }
                 }) {
                     Text("Update Now")
                 }

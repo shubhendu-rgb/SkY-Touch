@@ -12,6 +12,8 @@ import androidx.documentfile.provider.DocumentFile
 import androidx.work.*
 import com.example.data.AppDatabase
 import com.example.data.WallpaperConfigEntity
+import com.example.service.wallpaper.DefaultWallpaperManager
+import com.example.service.wallpaper.StaticImageEditStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.util.Calendar
@@ -24,6 +26,8 @@ class WallpaperWorker(
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         val screenType = inputData.getString("screenType") ?: return@withContext Result.failure()
+        // "Pause all wallpapers" is on: do nothing (it is re-scheduled when the switch goes off)
+        if (DefaultWallpaperManager.isPaused(context)) return@withContext Result.success()
         
         try {
             val db = AppDatabase.getDatabase(context)
@@ -103,6 +107,12 @@ class WallpaperWorker(
                     decodeSampledBitmapFromUri(context, uri, targetWidth, targetHeight) ?: return null
                 }
 
+                // Per-picture edit (rotate / crop / filter ...) made from the expanded wallpapers popup
+                val edit = StaticImageEditStore.get(context, uri.toString())
+
+                var resultBitmap: Bitmap = if (edit != null) {
+                    StaticImageEditStore.render(originalBitmap, edit, targetWidth, targetHeight)
+                } else run {
                 // Scale original bitmap to cover target dimensions while preserving aspect ratio and applying user scale
                 val baseScale = maxOf(
                     targetWidth.toFloat() / originalBitmap.width.toFloat(),
@@ -133,12 +143,14 @@ class WallpaperWorker(
                 val cropW = minOf(targetWidth, scaledBitmap.width - xOffset)
                 val cropH = minOf(targetHeight, scaledBitmap.height - yOffset)
 
-                var resultBitmap = Bitmap.createBitmap(scaledBitmap, xOffset, yOffset, cropW, cropH)
+                Bitmap.createBitmap(scaledBitmap, xOffset, yOffset, cropW, cropH)
+                }
 
-                // Apply blur if requested
-                if (blurRadius > 0) {
+                // Apply blur if requested (a blur set on this one picture wins over the screen-wide blur)
+                val effectiveBlur = if (edit != null && edit.blurRadius > 0) edit.blurRadius else blurRadius
+                if (effectiveBlur > 0) {
                     try {
-                        resultBitmap = fastBlur(resultBitmap, blurRadius)
+                        resultBitmap = fastBlur(resultBitmap, effectiveBlur)
                     } catch (e: Exception) {
                         Log.e("WallpaperWorker", "Blur failed: ${e.message}")
                     }
@@ -615,6 +627,7 @@ class WallpaperWorker(
             sourceOverride: String? = null
         ): Boolean = withContext(Dispatchers.IO) {
             try {
+                if (DefaultWallpaperManager.isPaused(context)) return@withContext false
                 val rule = WallpaperRules.load(context, trigger)
                 val target = targetOverride ?: rule.target
                 val filter = sourceOverride ?: rule.sourceFilter

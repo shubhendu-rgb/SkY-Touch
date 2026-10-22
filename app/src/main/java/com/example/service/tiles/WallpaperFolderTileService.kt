@@ -5,6 +5,7 @@ import android.service.quicksettings.TileService
 import android.widget.Toast
 import com.example.service.WallpaperRules
 import com.example.service.WallpaperWorker
+import com.example.service.wallpaper.DefaultWallpaperManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -23,6 +24,10 @@ class WallpaperFolderTileService : TileService() {
 
     override fun onClick() {
         val tile = qsTile ?: return
+        if (DefaultWallpaperManager.isPaused(applicationContext)) {
+            Toast.makeText(applicationContext, "Wallpaper changer is OFF. Turn it on with the Wallpaper Changer tile.", Toast.LENGTH_LONG).show()
+            return
+        }
         tile.state = Tile.STATE_ACTIVE
         tile.updateTile()
 

@@ -9,6 +9,7 @@ import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
 import android.widget.Toast
 import com.example.MainActivity
+import com.example.service.wallpaper.DefaultWallpaperManager
 import com.example.service.wallpaper.LiveWallpaperManager
 import com.example.service.wallpaper.SkyLiveWallpaperService
 
@@ -28,6 +29,10 @@ class LiveWallpaperTileService : TileService() {
 
     override fun onClick() {
         val tile = qsTile ?: return
+        if (DefaultWallpaperManager.isPaused(applicationContext)) {
+            Toast.makeText(applicationContext, "Wallpaper changer is OFF. Turn it on with the Wallpaper Changer tile.", Toast.LENGTH_LONG).show()
+            return
+        }
         tile.state = Tile.STATE_ACTIVE
         tile.updateTile()
 

@@ -162,7 +162,7 @@ fun DeveloperTab(
                             shape = RoundedCornerShape(8.dp)
                         ) {
                             Text(
-                                text = "v8.1",
+                                text = "v8.4",
                                 color = MaterialTheme.colorScheme.onSecondaryContainer,
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.Bold,
@@ -299,7 +299,7 @@ fun DeveloperTab(
                 contentAlignment = Alignment.Center
             ) {
                 Text(
-                    text = "SkY Touch v8.1 • Built with Jetpack Compose",
+                    text = "SkY Touch v8.4 • Built with Jetpack Compose",
                     fontSize = 11.sp,
                     color = MaterialTheme.colorScheme.outline
                 )

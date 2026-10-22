@@ -491,7 +491,11 @@ class VideoGlRenderer(
                 isContextMadeCurrent = false
             }
 
-            if (surfaceRecreated || !isContextMadeCurrent) {
+            // Several wallpaper engines (home, lock, preview) share the main thread, and eglMakeCurrent is
+            // per-thread. Another engine may have made ITS context current, so always verify ours.
+            val notCurrent = EGL14.eglGetCurrentContext() != eglContext ||
+                EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW) != eglSurface
+            if (surfaceRecreated || !isContextMadeCurrent || notCurrent) {
                 val ok = EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
                 isContextMadeCurrent = ok
                 return ok

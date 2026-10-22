@@ -338,6 +338,8 @@ object LiveWallpaperManager {
      * Direction can be "NEXT", "PREV", "PREVIOUS", or "RANDOM".
      */
     fun cycleLiveWallpaper(context: Context, direction: String = "NEXT"): LiveWallpaperConfig {
+        // "Pause all wallpapers" is on: keep whatever is active, never switch automatically
+        if (DefaultWallpaperManager.isPaused(context)) return getActiveConfig(context)
         val available = getAvailableWallpapers(context)
         if (available.isEmpty()) {
             val fallback = LiveWallpaperConfig()

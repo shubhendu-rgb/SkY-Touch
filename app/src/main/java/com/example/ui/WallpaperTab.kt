@@ -16,6 +16,9 @@ import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -25,6 +28,9 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items as gridItems
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -34,6 +40,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -74,7 +81,12 @@ fun WallpaperTab(
     initialType: Int = 0, // 0 = Static Wallpaper, 1 = Live Wallpaper
     onBack: (() -> Unit)? = null
 ) {
-    var selectedWallpaperType by remember { mutableIntStateOf(initialType) }
+    var selectedWallpaperType by rememberSaveable { mutableStateOf(initialType) }
+    var isFullscreenPreview by remember { mutableStateOf(false) }
+
+    LaunchedEffect(selectedWallpaperType) {
+        isFullscreenPreview = false
+    }
 
     Box(
         modifier = Modifier
@@ -84,23 +96,34 @@ fun WallpaperTab(
         // LAYER 1: Full-Screen Live/Static Background Preview touching ALL 4 SIDES!
         Box(modifier = Modifier.fillMaxSize()) {
             if (selectedWallpaperType == 1) {
-                LiveWallpaperTab(onBack = onBack ?: { selectedWallpaperType = 0 })
+                LiveWallpaperTab(
+                    onBack = onBack ?: { selectedWallpaperType = 0 },
+                    // keep clear of the floating Static / Live switcher drawn above this layer
+                    topContentPadding = if (isFullscreenPreview) 0.dp else 58.dp,
+                    onFullscreenChange = { isFullscreenPreview = it }
+                )
             } else {
                 StaticWallpaperScreen(
-                    onOpenLiveWallpaper = { selectedWallpaperType = 1 }
+                    onOpenLiveWallpaper = { selectedWallpaperType = 1 },
+                    onFullscreenChange = { isFullscreenPreview = it }
                 )
             }
         }
 
-        // LAYER 2: Floating Header with Back Button & High-End Switcher
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .statusBarsPadding()
-                .padding(horizontal = 16.dp, vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        // LAYER 2: Floating Header with Back Button & High-End Switcher (hidden during fullscreen preview)
+        AnimatedVisibility(
+            visible = !isFullscreenPreview,
+            enter = fadeIn(),
+            exit = fadeOut()
         ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .statusBarsPadding()
+                    .padding(horizontal = 16.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
             if (onBack != null) {
                 Surface(
                     onClick = onBack,
@@ -194,16 +217,18 @@ fun WallpaperTab(
                 }
             }
         }
+        }
     }
 }
 
 @Composable
 fun StaticWallpaperScreen(
-    onOpenLiveWallpaper: (() -> Unit)? = null
+    onOpenLiveWallpaper: (() -> Unit)? = null,
+    onFullscreenChange: ((Boolean) -> Unit)? = null
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    var screenType by remember { mutableStateOf("HOME") }
+    var screenType by rememberSaveable { mutableStateOf("HOME") }
     val dao = remember { AppDatabase.getDatabase(context).wallpaperConfigDao() }
     val configState by dao.getConfigFlow(screenType).collectAsState(initial = null)
 
@@ -216,6 +241,11 @@ fun StaticWallpaperScreen(
     }
     var showControls by remember { mutableStateOf(true) }
     var showFullscreenPreview by remember { mutableStateOf(false) }
+    var showExpandedImages by rememberSaveable { mutableStateOf(false) }
+
+    LaunchedEffect(showFullscreenPreview) {
+        onFullscreenChange?.invoke(showFullscreenPreview)
+    }
 
     LaunchedEffect(individualImages) {
         if (previewUriString == null || !individualImages.contains(previewUriString)) {
@@ -320,6 +350,8 @@ fun StaticWallpaperScreen(
                 } else null,
                 modifier = Modifier
                     .fillMaxSize()
+                    // own layer: drawn once and replayed while the list scrolls over it
+                    .graphicsLayer { }
                     .then(
                         if (currentBlurRadius > 0) Modifier.blur(currentBlurRadius.dp) else Modifier
                     )
@@ -374,6 +406,7 @@ fun StaticWallpaperScreen(
         Box(
             modifier = Modifier
                 .fillMaxSize()
+                .graphicsLayer { }
                 .background(
                     Brush.verticalGradient(
                         listOf(
@@ -503,6 +536,9 @@ fun StaticWallpaperScreen(
                     verticalArrangement = Arrangement.spacedBy(14.dp),
                     contentPadding = PaddingValues(bottom = 32.dp, top = 6.dp)
                 ) {
+                    // Pause everything + default Home / Lock wallpapers
+                    item { PauseWallpapersCard() }
+
                     // CARD 1: Add Wallpaper Images
                     item {
                         Card(
@@ -645,6 +681,24 @@ fun StaticWallpaperScreen(
                                     modifier = Modifier.fillMaxWidth(),
                                     horizontalArrangement = Arrangement.spacedBy(10.dp)
                                 ) {
+                                    if (individualImages.isNotEmpty()) {
+                                        IconButton(
+                                            onClick = { showExpandedImages = true },
+                                            modifier = Modifier
+                                                .size(40.dp)
+                                                .align(Alignment.CenterVertically)
+                                                .background(Color.White.copy(alpha = 0.15f), CircleShape)
+                                                .testTag("btn_expand_images")
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.OpenInFull,
+                                                contentDescription = "Expand selected wallpapers",
+                                                tint = Color.White,
+                                                modifier = Modifier.size(18.dp)
+                                            )
+                                        }
+                                    }
+
                                     Button(
                                         onClick = {
                                             imagePickerLauncher.launch(
@@ -1181,6 +1235,46 @@ fun StaticWallpaperScreen(
         }
     }
 
+    if (showExpandedImages) {
+        SelectedWallpapersDialog(
+            title = if (screenType == "HOME") "Home Screen wallpapers" else "Lock Screen wallpapers",
+            images = individualImages,
+            onDismiss = { showExpandedImages = false },
+            onApply = { uriStr ->
+                scope.launch {
+                    val currentCfg = config.copy(blurRadius = currentBlurRadius)
+                    val success = WallpaperWorker.applySpecificUriWallpaper(context, currentCfg, Uri.parse(uriStr))
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(
+                            context,
+                            if (success) "${if (screenType == "HOME") "Home" else "Lock"} wallpaper applied!" else "Could not apply this wallpaper",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                }
+            },
+            onRemove = { toRemove ->
+                scope.launch(Dispatchers.IO) {
+                    toRemove.forEach { uriStr ->
+                        try {
+                            val uri = Uri.parse(uriStr)
+                            if (uri.scheme == "file") File(uri.path ?: "").delete()
+                        } catch (_: Exception) {}
+                    }
+                    val remaining = individualImages.filter { it !in toRemove }
+                    val updated = config.copy(
+                        imageUris = if (remaining.isEmpty()) null else remaining.joinToString("|")
+                    )
+                    dao.saveConfig(updated)
+                    if (updated.isEnabled) {
+                        WallpaperWorker.scheduleWallpaperWork(context, updated)
+                    }
+                    if (remaining.isEmpty()) showExpandedImages = false
+                }
+            }
+        )
+    }
+
     if (showFullscreenPreview) {
         FullscreenAutoWallpaperDialog(
             screenType = screenType,
@@ -1714,5 +1808,216 @@ fun FullscreenAutoWallpaperDialog(
                 }
             }
         }
+    }
+}
+
+
+/**
+ * Popup showing all selected wallpapers in a 2 or 4 column grid.
+ * Tap images to select them, then remove the selected ones.
+ */
+@Composable
+private fun SelectedWallpapersDialog(
+    title: String,
+    images: List<String>,
+    onDismiss: () -> Unit,
+    onApply: (String) -> Unit,
+    onRemove: (Set<String>) -> Unit
+) {
+    var columns by remember { mutableIntStateOf(2) }
+    var selected by remember { mutableStateOf(setOf<String>()) }
+    var editingUri by remember { mutableStateOf<String?>(null) }
+    val popupContext = LocalContext.current
+
+    // Drop selections for images that no longer exist (after removal)
+    LaunchedEffect(images) { selected = selected.filter { it in images }.toSet() }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth(0.94f)
+                .fillMaxHeight(0.82f),
+            shape = RoundedCornerShape(24.dp),
+            color = Color(0xFF1B1B1F),
+            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.2f))
+        ) {
+            Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(title, color = Color.White, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            if (selected.isEmpty()) "${images.size} images \u2022 tap to select"
+                            else "${selected.size} of ${images.size} selected",
+                            color = Color.White.copy(alpha = 0.7f),
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    // Grid size toggle: 2 / 4 columns
+                    Row(
+                        modifier = Modifier.background(Color.White.copy(alpha = 0.12f), RoundedCornerShape(12.dp)).padding(2.dp),
+                        horizontalArrangement = Arrangement.spacedBy(2.dp)
+                    ) {
+                        listOf(2, 4).forEach { n ->
+                            Surface(
+                                onClick = { columns = n },
+                                shape = RoundedCornerShape(10.dp),
+                                color = if (columns == n) Color(0xFF1976D2) else Color.Transparent
+                            ) {
+                                Text(
+                                    "$n",
+                                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
+                                    color = Color.White,
+                                    fontWeight = if (columns == n) FontWeight.Bold else FontWeight.Normal
+                                )
+                            }
+                        }
+                    }
+                    IconButton(onClick = onDismiss) {
+                        Icon(Icons.Default.Close, contentDescription = "Close", tint = Color.White)
+                    }
+                }
+
+                LazyVerticalGrid(
+                    columns = GridCells.Fixed(columns),
+                    modifier = Modifier.weight(1f).fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    gridItems(images, key = { it }) { uriStr ->
+                        val isSel = uriStr in selected
+                        Box(
+                            modifier = Modifier
+                                .aspectRatio(0.62f)
+                                .clip(RoundedCornerShape(12.dp))
+                                .border(
+                                    width = if (isSel) 3.dp else 1.dp,
+                                    color = if (isSel) Color(0xFF64B5F6) else Color.White.copy(alpha = 0.25f),
+                                    shape = RoundedCornerShape(12.dp)
+                                )
+                                .clickable {
+                                    selected = if (isSel) selected - uriStr else selected + uriStr
+                                }
+                        ) {
+                            AsyncImage(
+                                model = Uri.parse(uriStr),
+                                contentDescription = "Wallpaper",
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier.fillMaxSize()
+                            )
+                            if (isSel) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .background(Color(0xFF1976D2).copy(alpha = 0.25f))
+                                )
+                            }
+                            // Edit this picture: rotate, crop / pinch, crop mode, blur, color filters
+                            val hasEdit = remember(uriStr, editingUri) {
+                                com.example.service.wallpaper.StaticImageEditStore.get(popupContext, uriStr) != null
+                            }
+                            Surface(
+                                onClick = { editingUri = uriStr },
+                                shape = CircleShape,
+                                color = if (hasEdit) Color(0xFF00897B) else Color.Black.copy(alpha = 0.65f),
+                                border = BorderStroke(1.5.dp, Color.White),
+                                modifier = Modifier
+                                    .align(Alignment.BottomStart)
+                                    .padding(6.dp)
+                                    .size(32.dp)
+                                    .testTag("btn_edit_static_popup")
+                            ) {
+                                Icon(
+                                    Icons.Default.Edit,
+                                    contentDescription = "Edit this wallpaper",
+                                    tint = Color.White,
+                                    modifier = Modifier.padding(7.dp)
+                                )
+                            }
+                            // Apply this picture right now (Home or Lock, whichever list this is)
+                            Surface(
+                                onClick = { onApply(uriStr) },
+                                shape = CircleShape,
+                                color = Color(0xFF1976D2),
+                                border = BorderStroke(1.5.dp, Color.White),
+                                modifier = Modifier
+                                    .align(Alignment.BottomEnd)
+                                    .padding(6.dp)
+                                    .size(32.dp)
+                                    .testTag("btn_apply_static_popup")
+                            ) {
+                                Icon(
+                                    Icons.Default.Wallpaper,
+                                    contentDescription = "Apply this wallpaper",
+                                    tint = Color.White,
+                                    modifier = Modifier.padding(6.dp)
+                                )
+                            }
+                            Surface(
+                                shape = CircleShape,
+                                color = if (isSel) Color(0xFF1976D2) else Color.Black.copy(alpha = 0.5f),
+                                border = BorderStroke(1.5.dp, Color.White),
+                                modifier = Modifier
+                                    .align(Alignment.TopEnd)
+                                    .padding(6.dp)
+                                    .size(22.dp)
+                            ) {
+                                if (isSel) {
+                                    Icon(
+                                        Icons.Default.Check,
+                                        contentDescription = "Selected",
+                                        tint = Color.White,
+                                        modifier = Modifier.padding(3.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = {
+                            selected = if (selected.size == images.size) emptySet() else images.toSet()
+                        },
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
+                        border = BorderStroke(1.dp, Color.White.copy(alpha = 0.35f))
+                    ) {
+                        Text(if (selected.size == images.size) "Deselect all" else "Select all")
+                    }
+                    Button(
+                        onClick = {
+                            val toRemove = selected
+                            selected = emptySet()
+                            onRemove(toRemove)
+                        },
+                        enabled = selected.isNotEmpty(),
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD32F2F))
+                    ) {
+                        Icon(Icons.Default.Delete, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text(if (selected.isEmpty()) "Remove" else "Remove (${selected.size})")
+                    }
+                }
+            }
+        }
+    }
+
+    editingUri?.let { uriToEdit ->
+        StaticImageEditDialog(
+            uriStr = uriToEdit,
+            onDismiss = { editingUri = null },
+            onApply = onApply
+        )
     }
 }
