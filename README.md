@@ -68,3 +68,5 @@ To function properly, SkY Touch requires the following standard Android permissi
  * Accessibility Service: Required to listen for touch gestures around the camera cutout and render floating overlays.
  * Notification Listener / SMS: Required for automated background OTP interception.
  * Overlay Permission: Required to draw the notch assistant and Side Deck handles over other apps.
+
+Ai Text Assistant credit -@swiftslate
