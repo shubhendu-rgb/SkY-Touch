@@ -75,7 +75,7 @@ object UpdateChecker {
         }
     }
 
-    /** "v8.4", "V8.4-beta", "SkY Touch 8.4" -> "8.4" */
+    /** "v8.6", "V8.6-beta", "SkY Touch 8.6" -> "8.6" */
     private fun normalizeVersion(raw: String): String {
         val match = Regex("""\d+(\.\d+)*""").find(raw)
         return match?.value ?: "0"

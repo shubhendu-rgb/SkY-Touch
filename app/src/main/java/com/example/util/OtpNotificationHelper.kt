@@ -13,7 +13,7 @@ import androidx.core.app.NotificationManagerCompat
 import com.example.MainActivity
 import com.example.R
 import com.example.service.OtpActionReceiver
-import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.delay
 
 object OtpNotificationHelper {
 
@@ -21,7 +21,14 @@ object OtpNotificationHelper {
     private const val CHANNEL_NAME = "Verification & OTP Alerts"
     private const val CHANNEL_DESCRIPTION = "Instant notifications and quick-copy actions for verification codes and OTPs"
 
-    private val notificationIdCounter = AtomicInteger(1000)
+    /** Only one OTP notification is ever shown, so it always uses the same id. */
+    const val OTP_NOTIFICATION_ID = 1001
+
+    /** A detected code waits this long before its notification appears. */
+    const val SHOW_DELAY_MS = 2000L
+
+    /** Bumped for every new code; a waiting notification only posts if it is still the latest. */
+    private val latestRequest = java.util.concurrent.atomic.AtomicLong(0L)
 
     fun createNotificationChannel(context: Context) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -40,6 +47,37 @@ object OtpNotificationHelper {
         }
     }
 
+    /**
+     * Shows the notification for a freshly detected code after [SHOW_DELAY_MS] (2 seconds).
+     *
+     * - The notification that is currently on screen (from an older code) is removed right away.
+     * - If another code is detected during the 2 second wait, this one is dropped and only the
+     *   newest code is ever shown.
+     *
+     * Suspends for the delay so callers that must stay alive (e.g. the SMS receiver) can await it.
+     */
+    suspend fun postOtpNotificationDelayed(
+        context: Context,
+        code: String,
+        sourcePackage: String = "",
+        snippet: String = ""
+    ) {
+        val appContext = context.applicationContext
+        val myRequest = latestRequest.incrementAndGet()
+
+        // Remove the older notification immediately, so only the latest code is shown
+        try {
+            NotificationManagerCompat.from(appContext).cancel(OTP_NOTIFICATION_ID)
+        } catch (_: Exception) {}
+
+        delay(SHOW_DELAY_MS)
+
+        // A newer code arrived while waiting: it will show its own notification
+        if (latestRequest.get() != myRequest) return
+
+        postOtpNotification(appContext, code, sourcePackage, snippet)
+    }
+
     fun postOtpNotification(
         context: Context,
         code: String,
@@ -53,7 +91,7 @@ object OtpNotificationHelper {
             return -1
         }
 
-        val notificationId = notificationIdCounter.incrementAndGet()
+        val notificationId = OTP_NOTIFICATION_ID
 
         // Content Intent: Open MainActivity
         val appIntent = Intent(context, MainActivity::class.java).apply {

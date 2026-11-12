@@ -158,6 +158,14 @@ class NotchRepository(private val db: AppDatabase) {
         gestureActionDao.insertAction(action)
     }
 
+    /** Removes every gesture action of an extra notch area (areas 2 and 3). */
+    suspend fun deleteAreaActions(areaId: Int) {
+        if (areaId <= 1) return
+        NotchAreas.GESTURE_NAMES.forEach { gesture ->
+            gestureActionDao.deleteAction(NotchAreas.actionKey(areaId, gesture))
+        }
+    }
+
     suspend fun incrementStat(gestureName: String) {
         triggerStatDao.incrementStat(gestureName)
     }

@@ -59,6 +59,7 @@ data class LiveWallpaperConfig(
     val colorFilter: LiveColorFilter = LiveColorFilter.NONE,
     val playbackSpeed: Float = 1.0f,     // 0.5f, 1.0f, 1.25f, 1.5f, 2.0f
     val isMuted: Boolean = true,
+    val volume: Float = 0.5f,            // 0.0f .. 1.0f, used when not muted
     val blurRadius: Int = 0,             // 0 = off, 1..30
     val scaleFactor: Float = 1.0f,       // 0.5f .. 4.0f
     val offsetX: Float = 0.0f,           // pixel pan offset X
@@ -76,6 +77,7 @@ data class LiveWallpaperConfig(
             put("colorFilter", colorFilter.name)
             put("playbackSpeed", playbackSpeed.toDouble())
             put("isMuted", isMuted)
+            put("volume", volume.toDouble())
             put("blurRadius", blurRadius)
             put("scaleFactor", scaleFactor.toDouble())
             put("offsetX", offsetX.toDouble())
@@ -108,6 +110,7 @@ data class LiveWallpaperConfig(
                 },
                 playbackSpeed = json.optDouble("playbackSpeed", 1.0).toFloat(),
                 isMuted = json.optBoolean("isMuted", true),
+                volume = json.optDouble("volume", 0.5).toFloat().coerceIn(0f, 1f),
                 blurRadius = json.optInt("blurRadius", 0),
                 scaleFactor = json.optDouble("scaleFactor", 1.0).toFloat().coerceIn(0.2f, 5.0f),
                 offsetX = json.optDouble("offsetX", 0.0).toFloat(),

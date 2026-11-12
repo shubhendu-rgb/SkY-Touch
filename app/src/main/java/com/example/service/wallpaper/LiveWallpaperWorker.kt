@@ -5,6 +5,7 @@ import android.util.Log
 import androidx.work.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import com.example.util.QuietHours
 import java.util.Calendar
 import java.util.concurrent.TimeUnit
 
@@ -20,16 +21,28 @@ class LiveWallpaperWorker(
                 return@withContext Result.failure()
             }
 
-            val isRandom = LiveWallpaperManager.isAutoChangeRandom(context)
-            LiveWallpaperManager.cycleNextLiveWallpaper(context, isRandom = isRandom)
-            LiveWallpaperManager.setLastAutoChangeTime(context, System.currentTimeMillis())
-
-            // If using exact schedule or interval < 15 min, re-enqueue next work
             val useSchedule = LiveWallpaperManager.isAutoChangeUseSchedule(context)
-            val interval = LiveWallpaperManager.getAutoChangeInterval(context)
-            if (useSchedule || interval < 15) {
-                scheduleWork(context)
+            val intervalMs = TimeUnit.MINUTES.toMillis(LiveWallpaperManager.getAutoChangeInterval(context).toLong())
+            val now = System.currentTimeMillis()
+            val last = LiveWallpaperManager.getLastAutoChangeTime(context)
+
+            if (QuietHours.isActiveNow(context, QuietHours.NIGHT_SAVER) || com.example.util.GameMode.isActive()) {
+                // Night Battery Saver / Game Mode: no change now, look again a bit later
+                scheduleWork(context, minDelayMs = TimeUnit.MINUTES.toMillis(5))
+                return@withContext Result.success()
             }
+
+            // Interval mode: never change earlier than the chosen interval (a stray or immediate run is ignored)
+            val minGapMs = if (useSchedule) TimeUnit.MINUTES.toMillis(30) else intervalMs * 9 / 10
+            val tooEarly = last > 0L && last <= now && (now - last) < minGapMs
+            if (!tooEarly) {
+                val isRandom = LiveWallpaperManager.isAutoChangeRandom(context)
+                LiveWallpaperManager.cycleNextLiveWallpaper(context, isRandom = isRandom)
+                LiveWallpaperManager.setLastAutoChangeTime(context, System.currentTimeMillis())
+            }
+
+            // Always chain the next run (exact time of day, or last change + interval)
+            scheduleWork(context)
 
             Result.success()
         } catch (e: Exception) {
@@ -41,11 +54,12 @@ class LiveWallpaperWorker(
     companion object {
         const val WORK_NAME = "LiveWallpaperAutoChangeWork"
 
-        fun scheduleWork(context: Context) {
+        fun scheduleWork(context: Context, minDelayMs: Long = 0L) {
             val workManager = WorkManager.getInstance(context)
             val isEnabled = LiveWallpaperManager.isAutoChangeEnabled(context)
 
-            if (!isEnabled) {
+            // Changer switched off or Night Battery Saver active: keep nothing scheduled
+            if (!isEnabled || DefaultWallpaperManager.isPaused(context) || com.example.util.NightSaver.isActive(context)) {
                 workManager.cancelUniqueWork(WORK_NAME)
                 return
             }
@@ -77,18 +91,21 @@ class LiveWallpaperWorker(
 
                 workManager.enqueueUniqueWork(WORK_NAME, ExistingWorkPolicy.REPLACE, request)
             } else {
-                if (intervalMinutes >= 15) {
-                    val request = PeriodicWorkRequestBuilder<LiveWallpaperWorker>(
-                        intervalMinutes.toLong(),
-                        TimeUnit.MINUTES
-                    ).build()
-                    workManager.enqueueUniquePeriodicWork(WORK_NAME, ExistingPeriodicWorkPolicy.UPDATE, request)
-                } else {
-                    val request = OneTimeWorkRequestBuilder<LiveWallpaperWorker>()
-                        .setInitialDelay(intervalMinutes.coerceAtLeast(1).toLong(), TimeUnit.MINUTES)
-                        .build()
-                    workManager.enqueueUniqueWork(WORK_NAME, ExistingWorkPolicy.REPLACE, request)
+                // One-time work chained after every change: the next change is exactly "last change + interval".
+                // (Periodic work runs once immediately when it is enqueued and its timer restarts every time it is
+                // re-scheduled, which made the wallpaper change much earlier than the chosen interval.)
+                val intervalMs = TimeUnit.MINUTES.toMillis(intervalMinutes.coerceAtLeast(1).toLong())
+                val now = System.currentTimeMillis()
+                var base = LiveWallpaperManager.getLastAutoChangeTime(context)
+                if (base <= 0L || base > now) {
+                    base = now
+                    LiveWallpaperManager.setLastAutoChangeTime(context, now)
                 }
+                val delay = maxOf((base + intervalMs - now).coerceAtLeast(0L), minDelayMs)
+                val request = OneTimeWorkRequestBuilder<LiveWallpaperWorker>()
+                    .setInitialDelay(delay, TimeUnit.MILLISECONDS)
+                    .build()
+                workManager.enqueueUniqueWork(WORK_NAME, ExistingWorkPolicy.REPLACE, request)
             }
         }
     }

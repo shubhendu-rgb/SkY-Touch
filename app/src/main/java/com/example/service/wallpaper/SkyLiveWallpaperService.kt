@@ -11,6 +11,7 @@ import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import android.media.MediaMetadataRetriever
 import android.media.MediaPlayer
+import com.example.util.NightSaver
 import android.media.PlaybackParams
 import android.os.Build
 import android.os.Handler
@@ -89,9 +90,17 @@ class SkyLiveWallpaperService : WallpaperService() {
                 old.playbackSpeed == config.playbackSpeed &&
                 !fallbackToPreset && mediaPlayer != null
             if (sameVideo) {
-                // Only crop / rotate / filter / position changed: no need to restart playback
+                // Only crop / rotate / filter / position / volume changed: no need to restart playback
                 glRenderer?.updateConfig(config)
+                try {
+                    val vol = if (config.isMuted) 0f else config.volume.coerceIn(0f, 1f)
+                    mediaPlayer?.setVolume(vol, vol)
+                } catch (_: Exception) {}
             } else {
+                // The GL renderer is kept alive across a restart, so it must be given the edited settings
+                // (crop / rotation / zoom / position / filter). Without this an animated GIF drawn on the GPU
+                // kept using the config it was created with, so nothing in the edit panel had any effect.
+                glRenderer?.updateConfig(config)
                 restartEngine()
             }
         }
@@ -143,7 +152,9 @@ class SkyLiveWallpaperService : WallpaperService() {
         // Dimensions
         private var surfaceWidth = 1080
         private var surfaceHeight = 1920
-        private var isVisibleState = false
+        private var isVisibleState = false // effective: Android says visible AND the user is on the home screen
+        private var systemVisible = false
+        private var gifOnGpu = false
 
         // Paint with color filter and high-quality filtering
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG).apply {
@@ -205,22 +216,89 @@ class SkyLiveWallpaperService : WallpaperService() {
             return dt
         }
 
+        private fun isNight(): Boolean = NightSaver.isActive(this@SkyLiveWallpaperService)
+
+        /** Night saver, or the wallpaper is on screen but must not animate (device locked / app in front). */
+        private fun isFrozen(): Boolean = isNight() || (systemVisible && !gateOpen())
+
+        private fun applyPlayerVolume(mp: MediaPlayer?) {
+            try {
+                val vol = if (config.isMuted) 0f else config.volume.coerceIn(0f, 1f)
+                mp?.setVolume(vol, vol)
+            } catch (_: Exception) {}
+        }
+
+        /** Shows one still frame without playing or animating (used when locked / an app is in front). */
+        private fun showFrozenFrame() {
+            if (surfaceHolder?.surface?.isValid != true) return
+            when {
+                config.mediaType == LiveMediaType.VIDEO && !fallbackToPreset ->
+                    if (mediaPlayer == null) startVideo() else glRenderer?.requestRender(force = true)
+                config.mediaType == LiveMediaType.GIF && animatedDrawable == null && fallbackBitmap == null ->
+                    startGif()
+                else -> {
+                    handler.removeCallbacks(loopRunnable)
+                    handler.post(loopRunnable)
+                }
+            }
+        }
+
+        private var lastDrawTime = 0L
+
+        /**
+         * How long to wait before drawing again on our own. 0 = never (only draw when something changes).
+         *  - animated GIF: the decoder tells us when the next frame is due (see its callback), so we only keep
+         *    a slow safety net instead of redrawing a full-size frame 50 times a second.
+         *  - still picture (single-frame GIF): drawn once, then no timer at all.
+         *  - procedural presets: 30 fps is smooth enough for slow aurora / nebula / matrix effects.
+         */
+        private fun nextFrameInterval(): Long = when {
+            config.mediaType == LiveMediaType.GIF && !fallbackToPreset ->
+                if (animatedDrawable != null) (if (gifOnGpu) 500L else 250L) else 0L
+            else -> 33L
+        }
+
         private val loopRunnable = object : Runnable {
             override fun run() {
-                if (!isVisibleState) return
+                val night = isFrozen()
+                if (!isVisibleState && !night) return
                 val frameStart = SystemClock.uptimeMillis()
                 try {
                     drawFrame()
                 } catch (t: Throwable) {
                     Log.e(tag, "drawFrame loop error: ${t.message}")
                 } finally {
-                    if (isVisibleState) {
-                        handler.removeCallbacks(this)
-                        val elapsed = SystemClock.uptimeMillis() - frameStart
-                        val targetInterval = 20L // ~50 FPS target
-                        val nextDelay = (targetInterval - elapsed).coerceIn(4L, 24L)
-                        handler.postDelayed(this, nextDelay)
+                    lastDrawTime = frameStart
+                    handler.removeCallbacks(this)
+                    if (night) {
+                        // Night Battery Saver: leave one frame on screen and stop animating
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && animatedDrawable is AnimatedImageDrawable) {
+                            try { (animatedDrawable as AnimatedImageDrawable).stop() } catch (_: Exception) {}
+                        }
+                    } else if (isVisibleState) {
+                        val interval = nextFrameInterval()
+                        if (interval > 0L) {
+                            val elapsed = SystemClock.uptimeMillis() - frameStart
+                            handler.postDelayed(this, (interval - elapsed).coerceAtLeast(4L))
+                        }
                     }
+                }
+            }
+        }
+
+        /** Night Battery Saver started or ended (called by NightSaver). */
+        fun onNightSaverChanged() {
+            handler.post {
+                if (!isVisibleState) return@post // handled by the next visibility change
+                if (isNight()) {
+                    if (config.mediaType == LiveMediaType.VIDEO && !fallbackToPreset) {
+                        pauseMedia() // the last video frame stays on the screen
+                    } else {
+                        handler.removeCallbacks(loopRunnable)
+                        handler.post(loopRunnable) // draws one frame, then freezes
+                    }
+                } else {
+                    resumeMedia()
                 }
             }
         }
@@ -231,6 +309,7 @@ class SkyLiveWallpaperService : WallpaperService() {
         private val videoWatchdogRunnable = object : Runnable {
             override fun run() {
                 if (!isVisibleState || config.mediaType != LiveMediaType.VIDEO || fallbackToPreset) return
+                if (isFrozen()) return // night saver / locked / app in front: never restart playback
 
                 try {
                     val mp = mediaPlayer
@@ -301,12 +380,21 @@ class SkyLiveWallpaperService : WallpaperService() {
             surfaceHolder.setFormat(PixelFormat.RGBA_8888)
             val prefs = getSharedPreferences("sky_live_wallpaper_prefs", Context.MODE_PRIVATE)
             prefs.registerOnSharedPreferenceChangeListener(this)
+            try {
+                val f = android.content.IntentFilter().apply {
+                    addAction(Intent.ACTION_SCREEN_ON)
+                    addAction(Intent.ACTION_SCREEN_OFF)
+                    addAction(Intent.ACTION_USER_PRESENT)
+                }
+                this@SkyLiveWallpaperService.registerReceiver(screenStateReceiver, f)
+            } catch (_: Exception) {}
             loadConfig()
         }
 
         override fun onDestroy() {
             super.onDestroy()
             activeEngines.remove(this)
+            try { this@SkyLiveWallpaperService.unregisterReceiver(screenStateReceiver) } catch (_: Exception) {}
             handler.removeCallbacks(applyConfigRunnable)
             val prefs = getSharedPreferences("sky_live_wallpaper_prefs", Context.MODE_PRIVATE)
             prefs.unregisterOnSharedPreferenceChangeListener(this)
@@ -376,8 +464,37 @@ class SkyLiveWallpaperService : WallpaperService() {
 
         override fun onVisibilityChanged(visible: Boolean) {
             super.onVisibilityChanged(visible)
-            isVisibleState = visible
-            if (visible) {
+            systemVisible = visible
+            applyRunState(force = true)
+        }
+
+        /** The wallpaper only runs for the home screen: not while an app is open or the device is locked. */
+        private fun gateOpen(): Boolean = isPreview || LiveWallpaperGate.isOpen(this@SkyLiveWallpaperService)
+
+        fun onGateChanged() {
+            handler.post { applyRunState(force = false) }
+        }
+
+        private val screenStateReceiver = object : android.content.BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                handler.post { applyRunState(force = false) }
+            }
+        }
+
+        private fun applyRunState(force: Boolean) {
+            val run = systemVisible && gateOpen()
+            if (!force && run == isVisibleState) return
+            isVisibleState = run
+            if (run) {
+                // Self-heal: if the GL renderer died (shared EGL display lost, previous engine torn down
+                // at the same time) rebuild everything instead of staying black.
+                val deadRenderer = glRenderer?.let { !it.isInitialized } == true
+                if (deadRenderer && surfaceHolder?.surface?.isValid == true) {
+                    glRenderer?.release()
+                    glRenderer = null
+                    glFailed = false
+                    startMedia()
+                }
                 // Securely re-fetch the active SurfaceHolder and resume
                 val holder = surfaceHolder
                 if (holder?.surface?.isValid == true) {
@@ -406,6 +523,8 @@ class SkyLiveWallpaperService : WallpaperService() {
                 }
             } else {
                 pauseMedia()
+                // Locked screen / an app in front while the wallpaper is still on screen: show one still frame
+                if (systemVisible) showFrozenFrame()
             }
         }
 
@@ -420,8 +539,14 @@ class SkyLiveWallpaperService : WallpaperService() {
             super.onOffsetsChanged(xOffset, yOffset, xOffsetStep, yOffsetStep, xPixelOffset, yPixelOffset)
             xOffsetFrac = xOffset
             glRenderer?.setOffset(xOffset)
-            if (isVisibleState && (config.mediaType != LiveMediaType.VIDEO || fallbackToPreset)) {
-                drawFrame()
+            if (isVisibleState && gifOnGpu && config.mediaType == LiveMediaType.GIF && !fallbackToPreset) {
+                glRenderer?.requestRender(force = true) // the GPU shader applies the parallax, no redraw of the GIF
+            } else if (isVisibleState && (config.mediaType != LiveMediaType.VIDEO || fallbackToPreset)) {
+                val now = SystemClock.uptimeMillis()
+                if (now - lastDrawTime >= 16L) { // at most ~60 redraws per second while swiping
+                    lastDrawTime = now
+                    drawFrame()
+                }
             }
         }
 
@@ -438,11 +563,14 @@ class SkyLiveWallpaperService : WallpaperService() {
             stopAll()
 
             when (config.mediaType) {
+                // Video / GIF are only loaded while the wallpaper is on screen. A wallpaper that changes while
+                // another app is in front no longer starts a player in the background (no audio session,
+                // no decoding); it is loaded when the home screen is shown again.
                 LiveMediaType.VIDEO -> {
-                    startVideo()
+                    if (systemVisible) startVideo()
                 }
                 LiveMediaType.GIF -> {
-                    startGif()
+                    if (systemVisible) startGif()
                 }
                 LiveMediaType.PRESET_AURORA,
                 LiveMediaType.PRESET_NEBULA,
@@ -556,7 +684,7 @@ class SkyLiveWallpaperService : WallpaperService() {
                 player.isLooping = true
                 player.setSurface(targetSurface)
 
-                val vol = if (config.isMuted) 0f else 0.5f
+                val vol = if (config.isMuted) 0f else config.volume.coerceIn(0f, 1f)
                 player.setVolume(vol, vol)
 
                 player.setOnVideoSizeChangedListener { mp, width, height ->
@@ -579,7 +707,7 @@ class SkyLiveWallpaperService : WallpaperService() {
                 player.setOnSeekCompleteListener { mp ->
                     if (mediaPlayer !== mp || !playerPrepared) return@setOnSeekCompleteListener
                     try {
-                        if (!mp.isPlaying) mp.start()
+                        if (!mp.isPlaying && !isFrozen() && isVisibleState) mp.start()
                         renderer?.requestRender(force = true)
                     } catch (_: Exception) {}
                 }
@@ -604,13 +732,29 @@ class SkyLiveWallpaperService : WallpaperService() {
                             mp.playbackParams = params
                         } catch (_: Exception) {}
                     }
+                    val frozen = isFrozen()
+                    if (!isVisibleState && !frozen) {
+                        // Not on screen (e.g. the wallpaper changed while another app is in front):
+                        // stay prepared but silent and idle. resumeMedia() starts it when it is shown.
+                        return@setOnPreparedListener
+                    }
                     try {
+                        if (frozen) {
+                            try { mp.setVolume(0f, 0f) } catch (_: Exception) {}
+                        }
                         mp.start()
                         renderer?.requestRender(force = true)
                     } catch (e: Exception) {
                         Log.e(tag, "mp.start error: ${e.message}")
                     }
-                    startVideoWatchdog()
+                    if (frozen) {
+                        // show the first frame, then hold still
+                        handler.postDelayed({
+                            try { if (mediaPlayer === mp && isFrozen() && mp.isPlaying) mp.pause() } catch (_: Exception) {}
+                        }, 400)
+                    } else {
+                        startVideoWatchdog()
+                    }
                 }
 
                 player.setOnErrorListener { mp, what, extra ->
@@ -663,6 +807,7 @@ class SkyLiveWallpaperService : WallpaperService() {
             }
 
             fallbackToPreset = false
+            gifOnGpu = false
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && animatedDrawable is AnimatedImageDrawable) {
                 try {
                     (animatedDrawable as AnimatedImageDrawable).stop()
@@ -674,6 +819,13 @@ class SkyLiveWallpaperService : WallpaperService() {
 
             try {
                 val file = File(path)
+
+                // GPU path: frames go straight to the GL texture, so they are decoded at their own size
+                // (never enlarged on the CPU) and the GPU does the scaling.
+                val gpuRenderer = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    glForCanvas()?.takeIf { it.videoSurface?.isValid == true }
+                } else null
+                val wantGpu = gpuRenderer != null
 
                 // 1. Primary modern Android ImageDecoder API for full frame fidelity & hardware buffer efficiency
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
@@ -703,7 +855,8 @@ class SkyLiveWallpaperService : WallpaperService() {
                                 else -> maxOf(boxW / srcW, boxH / srcH)
                             }
                             // Cap at 4096px safety ceiling; user zoom is still applied on the canvas
-                            val f = minOf(fit, 4096f / srcW, 4096f / srcH)
+                            val f = if (wantGpu) minOf(fit, 1f, 3000f / srcW, 3000f / srcH)
+                                    else minOf(fit, 4096f / srcW, 4096f / srcH)
                             val targetW = (srcW * f).toInt().coerceAtLeast(1)
                             val targetH = (srcH * f).toInt().coerceAtLeast(1)
                             if (targetW != srcW || targetH != srcH) {
@@ -714,7 +867,7 @@ class SkyLiveWallpaperService : WallpaperService() {
                             drawable.repeatCount = AnimatedImageDrawable.REPEAT_INFINITE
                             drawable.callback = object : Drawable.Callback {
                                 override fun invalidateDrawable(who: Drawable) {
-                                    if (isVisibleState) {
+                                    if (isVisibleState || isFrozen()) {
                                         handler.removeCallbacks(loopRunnable)
                                         handler.post(loopRunnable)
                                     }
@@ -726,8 +879,15 @@ class SkyLiveWallpaperService : WallpaperService() {
                                     handler.removeCallbacks(what, who)
                                 }
                             }
-                            drawable.start()
                             animatedDrawable = drawable
+                            val gw = drawable.intrinsicWidth
+                            val gh = drawable.intrinsicHeight
+                            if (gpuRenderer != null && gw > 0 && gh > 0) {
+                                gpuRenderer.updateConfig(config)
+                                gpuRenderer.setVideoSize(gw, gh, 0)
+                                gifOnGpu = true
+                            }
+                            drawable.start()
                         } else if (drawable is BitmapDrawable) {
                             fallbackBitmap = drawable.bitmap
                         }
@@ -764,7 +924,7 @@ class SkyLiveWallpaperService : WallpaperService() {
                 }
 
                 if (animatedDrawable != null || fallbackBitmap != null) {
-                    if (isVisibleState) {
+                    if (isVisibleState || isFrozen()) {
                         handler.post(loopRunnable)
                     }
                 } else {
@@ -788,7 +948,7 @@ class SkyLiveWallpaperService : WallpaperService() {
             animatedDrawable = null
             fallbackBitmap?.recycle()
             fallbackBitmap = null
-            if (isVisibleState) {
+            if (isVisibleState || isFrozen()) {
                 handler.post(loopRunnable)
             }
         }
@@ -809,6 +969,16 @@ class SkyLiveWallpaperService : WallpaperService() {
         }
 
         private fun resumeMedia() {
+            if (isNight()) {
+                // Night Battery Saver: show one still frame and do not animate or play anything
+                if (config.mediaType == LiveMediaType.VIDEO && !fallbackToPreset) {
+                    if (mediaPlayer == null) startVideo() else glRenderer?.requestRender(force = true)
+                } else {
+                    handler.removeCallbacks(loopRunnable)
+                    handler.post(loopRunnable)
+                }
+                return
+            }
             if (config.mediaType == LiveMediaType.VIDEO && !fallbackToPreset) {
                 try {
                     glRenderer?.ensureSurfaceValid()
@@ -816,6 +986,7 @@ class SkyLiveWallpaperService : WallpaperService() {
                     if (mp == null) {
                         startVideo()
                     } else if (playerPrepared) {
+                        applyPlayerVolume(mp)
                         if (!mp.isPlaying) {
                             mp.start()
                         }
@@ -876,6 +1047,12 @@ class SkyLiveWallpaperService : WallpaperService() {
                 return
             }
 
+            // Animated GIF on the GPU: the frame is drawn with a hardware canvas straight into the GL video
+            // texture (no CPU copy, no bitmap upload) and the same shader as videos does crop / zoom / parallax.
+            if (gifOnGpu && !fallbackToPreset && config.mediaType == LiveMediaType.GIF) {
+                if (pumpGifToGpu()) return
+            }
+
             // GIF / presets: render through OpenGL so the surface is never tied to the Canvas API
             val gl = glForCanvas()
             if (gl != null) {
@@ -920,6 +1097,27 @@ class SkyLiveWallpaperService : WallpaperService() {
                         }
                     }
                 }
+            }
+        }
+
+        private fun pumpGifToGpu(): Boolean {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return false
+            val ad = animatedDrawable as? AnimatedImageDrawable ?: return false
+            val surface = glRenderer?.videoSurface ?: return false
+            if (!surface.isValid) return false
+            var canvas: Canvas? = null
+            return try {
+                canvas = surface.lockHardwareCanvas()
+                canvas.drawColor(Color.TRANSPARENT, android.graphics.PorterDuff.Mode.CLEAR)
+                ad.setBounds(0, 0, ad.intrinsicWidth, ad.intrinsicHeight)
+                ad.draw(canvas)
+                true
+            } catch (e: Exception) {
+                Log.w(tag, "GPU GIF path failed, using the software path: ${e.message}")
+                gifOnGpu = false
+                false
+            } finally {
+                canvas?.let { try { surface.unlockCanvasAndPost(it) } catch (_: Exception) {} }
             }
         }
 

@@ -73,23 +73,32 @@ object DynamicNotchManager {
         activeBehavior.value = BehaviorPreferences.load(context)
     }
 
+    private fun notifyService() {
+        try {
+            val s = NotchAccessibilityService.instance ?: return
+            s.javaClass.getMethod("notifyDynamicNotchChanged").invoke(s)
+        } catch (_: Throwable) {
+            // Optional service callback
+        }
+    }
+
     fun setEnabled(context: Context, enabled: Boolean) {
         isDynamicNotchEnabled.value = enabled
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         prefs.edit().putBoolean(KEY_ENABLED, enabled).apply()
-        NotchAccessibilityService.instance?.notifyDynamicNotchChanged()
+        notifyService()
     }
 
     fun updateSkin(context: Context, skin: DynamicIslandSkin) {
         activeSkin.value = skin
         PredefinedSkins.saveSkin(context, skin)
-        NotchAccessibilityService.instance?.notifyDynamicNotchChanged()
+        notifyService()
     }
 
     fun updateBehavior(context: Context, behavior: DynamicNotchBehavior) {
         activeBehavior.value = behavior
         BehaviorPreferences.save(context, behavior)
-        NotchAccessibilityService.instance?.notifyDynamicNotchChanged()
+        notifyService()
     }
 
     fun postCapsuleEvent(event: MiniCapsuleEvent) {
@@ -178,6 +187,6 @@ object DynamicNotchManager {
 
     fun toggleOverlayState() {
         activeState.value = IslandState.COLLAPSED
-        NotchAccessibilityService.instance?.notifyDynamicNotchChanged()
+        notifyService()
     }
 }

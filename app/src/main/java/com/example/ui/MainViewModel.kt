@@ -6,7 +6,11 @@ import androidx.lifecycle.viewModelScope
 import com.example.data.CodeDetectionConfigEntity
 import com.example.data.DetectedCodeEntity
 import com.example.data.GestureActionEntity
+import android.content.Context
+import com.example.data.NotchAreaGeometry
+import com.example.data.NotchAreas
 import com.example.data.NotchConfigEntity
+import com.example.data.withAreaGeometry
 import com.example.data.NotchRepository
 import com.example.data.SideDeckConfigEntity
 import com.example.data.TextAssistantConfigEntity
@@ -109,6 +113,45 @@ class MainViewModel(val repository: NotchRepository) : ViewModel() {
         configDebounceJob = viewModelScope.launch {
             delay(delayMs)
             repository.updateConfig(config)
+        }
+    }
+
+    private var areaDebounceJob: Job? = null
+
+    /**
+     * Saves the position / size of one notch gesture area. While a slider is being dragged
+     * ([immediate] = false) writes are debounced so the overlay window is not rebuilt on every pixel.
+     */
+    fun saveNotchArea(context: Context, area: NotchAreaGeometry, immediate: Boolean, delayMs: Long = 120L) {
+        val appContext = context.applicationContext
+        areaDebounceJob?.cancel()
+        val write: suspend () -> Unit = {
+            if (area.id <= 1) {
+                repository.updateConfig(repository.getDirectConfig().withAreaGeometry(area))
+            } else {
+                NotchAreas.update(appContext, area)
+            }
+        }
+        if (immediate) {
+            viewModelScope.launch { write() }
+        } else {
+            areaDebounceJob = viewModelScope.launch {
+                delay(delayMs)
+                write()
+            }
+        }
+    }
+
+    /** Adds notch gesture area 2 or 3. Returns the new area, or null when the maximum (3) is reached. */
+    fun addNotchArea(context: Context): NotchAreaGeometry? = NotchAreas.add(context.applicationContext)
+
+    /** Removes area 2 or 3 together with its gesture actions. */
+    fun removeNotchArea(context: Context, areaId: Int) {
+        if (areaId <= 1) return
+        val appContext = context.applicationContext
+        viewModelScope.launch {
+            NotchAreas.remove(appContext, areaId)
+            repository.deleteAreaActions(areaId)
         }
     }
 

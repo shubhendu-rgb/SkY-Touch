@@ -52,7 +52,7 @@ fun BackupRestoreTab(
             scope.launch {
                 try {
                     val jsonStr = withContext(Dispatchers.IO) {
-                        BackupHelper.exportToString(repository)
+                        BackupHelper.exportToString(repository, context)
                     }
                     val success = withContext(Dispatchers.IO) {
                         BackupHelper.writeStringToUri(context, uri, jsonStr)
@@ -84,7 +84,7 @@ fun BackupRestoreTab(
                     }
                     if (jsonStr != null) {
                         val success = withContext(Dispatchers.IO) {
-                            BackupHelper.importFromString(repository, jsonStr)
+                            BackupHelper.importFromString(repository, jsonStr, context)
                         }
                         if (success) {
                             showRestartDialog = true

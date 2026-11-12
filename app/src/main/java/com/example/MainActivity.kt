@@ -87,7 +87,11 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import com.example.data.AppDatabase
 import com.example.data.GestureActionEntity
+import com.example.data.NotchAreaGeometry
+import com.example.data.NotchAreas
 import com.example.data.NotchConfigEntity
+import com.example.data.toAreaGeometry
+import com.example.util.WebLinkHelper
 import com.example.data.NotchRepository
 import com.example.data.TriggerStatEntity
 import com.example.service.NotchAccessibilityService
@@ -105,15 +109,17 @@ class MainActivity : ComponentActivity() {
     private lateinit var db: AppDatabase
     private lateinit var repository: NotchRepository
     private val viewModel: MainViewModel by viewModels { MainViewModelFactory(repository) }
+    private val targetScreenState = mutableStateOf<ScreenType?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        targetScreenState.value = parseScreenFromIntent(intent)
         db = AppDatabase.getDatabase(this)
         repository = NotchRepository(db)
         OtpNotificationHelper.createNotificationChannel(this)
         com.example.service.audio.EqualizerController.init(this)
         com.example.service.audio.EqualizerController.ensureService(this)
-        com.example.ui.island.DynamicNotchManager.initialize(this)
+        NotchAreas.init(this)
 
         enableEdgeToEdge(statusBarStyle = androidx.activity.SystemBarStyle.auto(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT), navigationBarStyle = androidx.activity.SystemBarStyle.auto(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT))
         val prefs = getSharedPreferences("theme_prefs", Context.MODE_PRIVATE)
@@ -155,10 +161,21 @@ class MainActivity : ComponentActivity() {
                             prefs.edit().putBoolean("dynamic_color", it).apply()
                         },
                         modifier = Modifier.padding(innerPadding),
-                        onOpenSettings = { openAccessibilitySettings() }
+                        onOpenSettings = { openAccessibilitySettings() },
+                        targetScreen = targetScreenState.value,
+                        onTargetScreenConsumed = { targetScreenState.value = null }
                     )
                 }
             }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        val target = parseScreenFromIntent(intent)
+        if (target != null) {
+            targetScreenState.value = target
         }
     }
 
@@ -212,9 +229,59 @@ fun isAccessibilityServiceEnabled(context: Context, serviceClass: Class<*>): Boo
 }
 
 enum class ScreenType {
-    DASHBOARD, GESTURES, CALIBRATION, SIDE_DECK, CODE_DETECTION, TEXT_ASSISTANT, AUTOCLICK, ANALYTICS, DEVELOPER, RECORDINGS, EXCLUDED_APPS, INSTRUCTIONS, BACKUP_RESTORE, WALLPAPER, LIVE_WALLPAPER, DYNAMIC_NOTCH, EQUALIZER
+    DASHBOARD, GESTURES, CALIBRATION, SIDE_DECK, CODE_DETECTION, TEXT_ASSISTANT, AUTOCLICK, ANALYTICS, DEVELOPER, RECORDINGS, VIDEO_EDITOR, NIGHT_SAVER, GAME_MODE, WIDGET_STUDIO, EXCLUDED_APPS, INSTRUCTIONS, BACKUP_RESTORE, WALLPAPER, LIVE_WALLPAPER, EQUALIZER
 }
 
+/**
+ * Maps incoming intent (explicit OPEN_SCREEN extra or Quick Settings tile long-press)
+ * to the exact feature screen in the app.
+ */
+fun parseScreenFromIntent(intent: Intent?): ScreenType? {
+    if (intent == null) return null
+    // 1. Direct explicit extra from internal notifications or shortcuts
+    when (intent.getStringExtra("OPEN_SCREEN")) {
+        "CODE_DETECTION" -> return ScreenType.CODE_DETECTION
+        "EQUALIZER" -> return ScreenType.EQUALIZER
+        "DYNAMIC_NOTCH" -> return ScreenType.GESTURES
+        "GESTURES" -> return ScreenType.GESTURES
+        "SIDE_DECK" -> return ScreenType.SIDE_DECK
+        "TEXT_ASSISTANT" -> return ScreenType.TEXT_ASSISTANT
+        "AUTOCLICK" -> return ScreenType.AUTOCLICK
+        "WALLPAPER" -> return ScreenType.WALLPAPER
+        "LIVE_WALLPAPER" -> return ScreenType.LIVE_WALLPAPER
+        "RECORDINGS" -> return ScreenType.RECORDINGS
+        "VIDEO_EDITOR" -> return ScreenType.VIDEO_EDITOR
+        "WIDGET_STUDIO" -> return ScreenType.WIDGET_STUDIO
+    }
+
+    // 2. Quick Settings Tile Long-Click (android.service.quicksettings.action.QS_TILE_PREFERENCES)
+    val comp: ComponentName? = try {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent.getParcelableExtra(Intent.EXTRA_COMPONENT_NAME, ComponentName::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            intent.getParcelableExtra(Intent.EXTRA_COMPONENT_NAME)
+        }
+    } catch (_: Throwable) {
+        null
+    } ?: intent.component
+
+    val className = (comp?.className ?: intent.getStringExtra(Intent.EXTRA_COMPONENT_NAME) ?: "").lowercase()
+
+    return when {
+        className.contains("autoclick") -> ScreenType.AUTOCLICK
+        className.contains("equalizer") -> ScreenType.EQUALIZER
+        className.contains("livewallpaper") -> ScreenType.LIVE_WALLPAPER
+        className.contains("wallpaper") -> ScreenType.WALLPAPER
+        className.contains("notch") -> ScreenType.GESTURES
+        className.contains("sidedeck") -> ScreenType.SIDE_DECK
+        className.contains("stoprecording") || className.contains("record") -> ScreenType.RECORDINGS
+        className.contains("textassistant") || className.contains("assistant") -> ScreenType.TEXT_ASSISTANT
+        className.contains("otp") || className.contains("code") -> ScreenType.CODE_DETECTION
+        intent.action == "android.service.quicksettings.action.QS_TILE_PREFERENCES" -> ScreenType.DASHBOARD
+        else -> null
+    }
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -226,7 +293,9 @@ fun MainContentScreen(
     onDarkModeChange: (Boolean) -> Unit,
     onDynamicColorChange: (Boolean) -> Unit,
     modifier: Modifier = Modifier,
-    onOpenSettings: () -> Unit
+    onOpenSettings: () -> Unit,
+    targetScreen: ScreenType? = null,
+    onTargetScreenConsumed: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
@@ -310,17 +379,29 @@ fun MainContentScreen(
     }
 
     val initialScreen = remember {
-        when ((context as? ComponentActivity)?.intent?.getStringExtra("OPEN_SCREEN")) {
-            "CODE_DETECTION" -> ScreenType.CODE_DETECTION
-            "EQUALIZER" -> ScreenType.EQUALIZER
-            else -> ScreenType.DASHBOARD
-        }
+        targetScreen ?: parseScreenFromIntent((context as? ComponentActivity)?.intent) ?: ScreenType.DASHBOARD
     }
     // rememberSaveable: Android re-creates the activity after the phone is locked / unlocked (and whenever the
     // system theme colors change). Plain remember lost the open screen every time, so you landed on the Dashboard.
     var currentScreen by rememberSaveable { mutableStateOf(initialScreen) }
+
+    LaunchedEffect(targetScreen) {
+        if (targetScreen != null) {
+            currentScreen = targetScreen
+            onTargetScreenConsumed()
+        }
+    }
     var autoClickSubScreen by rememberSaveable { mutableStateOf<AutoClickSubScreen?>(null) }
     var editingActionGesture by rememberSaveable { mutableStateOf<String?>(null) }
+    // Notch gesture areas: extra areas 2 and 3 (area 1 is the original notch) and the one being edited
+    val extraNotchAreas by NotchAreas.extraAreas.collectAsStateWithLifecycle()
+    var selectedGestureArea by rememberSaveable { mutableStateOf(1) }
+    // Permissions overview (shield icon on the Dashboard)
+    val appPermissions = com.example.ui.rememberAppPermissions()
+    var showPermissions by rememberSaveable { mutableStateOf(false) }
+    val saveNotchArea: (NotchAreaGeometry, Boolean) -> Unit = { area, immediate ->
+        viewModel.saveNotchArea(context, area, immediate)
+    }
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val scope = rememberCoroutineScope()
 
@@ -406,7 +487,7 @@ fun MainContentScreen(
                             shape = RoundedCornerShape(6.dp)
                         ) {
                             Text(
-                                text = "v8.4",
+                                text = "v8.6",
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.Bold,
                                 color = MaterialTheme.colorScheme.primary,
@@ -465,6 +546,42 @@ fun MainContentScreen(
                         selected = currentScreen == ScreenType.RECORDINGS,
                         onClick = {
                             currentScreen = ScreenType.RECORDINGS
+                            scope.launch { drawerState.close() }
+                        }
+                    )
+                    NavigationDrawerItem(
+                        icon = { Icon(Icons.Default.ContentCut, contentDescription = null) },
+                        label = { Text("Video Editor") },
+                        selected = currentScreen == ScreenType.VIDEO_EDITOR,
+                        onClick = {
+                            currentScreen = ScreenType.VIDEO_EDITOR
+                            scope.launch { drawerState.close() }
+                        }
+                    )
+                    NavigationDrawerItem(
+                        icon = { Icon(Icons.Default.BatterySaver, contentDescription = null) },
+                        label = { Text("Night Battery Saver") },
+                        selected = currentScreen == ScreenType.NIGHT_SAVER,
+                        onClick = {
+                            currentScreen = ScreenType.NIGHT_SAVER
+                            scope.launch { drawerState.close() }
+                        }
+                    )
+                    NavigationDrawerItem(
+                        icon = { Icon(Icons.Default.SportsEsports, contentDescription = null) },
+                        label = { Text("Game Mode") },
+                        selected = currentScreen == ScreenType.GAME_MODE,
+                        onClick = {
+                            currentScreen = ScreenType.GAME_MODE
+                            scope.launch { drawerState.close() }
+                        }
+                    )
+                    NavigationDrawerItem(
+                        icon = { Icon(Icons.Default.Widgets, contentDescription = null) },
+                        label = { Text("Widget Studio") },
+                        selected = currentScreen == ScreenType.WIDGET_STUDIO,
+                        onClick = {
+                            currentScreen = ScreenType.WIDGET_STUDIO
                             scope.launch { drawerState.close() }
                         }
                     )
@@ -532,7 +649,6 @@ fun MainContentScreen(
         }
 
         val showMainTopBar = !(currentScreen == ScreenType.AUTOCLICK && autoClickSubScreen != null) &&
-            currentScreen != ScreenType.DYNAMIC_NOTCH &&
             currentScreen != ScreenType.WALLPAPER &&
             currentScreen != ScreenType.LIVE_WALLPAPER
 
@@ -553,12 +669,15 @@ fun MainContentScreen(
                                     ScreenType.ANALYTICS -> "Analytics"
                                     ScreenType.DEVELOPER -> "About Developer"
                                     ScreenType.RECORDINGS -> "Video Recordings"
+                                    ScreenType.VIDEO_EDITOR -> "Video Editor"
+                                    ScreenType.NIGHT_SAVER -> "Night Battery Saver"
+                                    ScreenType.GAME_MODE -> "Game Mode"
+                                    ScreenType.WIDGET_STUDIO -> "Widget Studio"
                                     ScreenType.EXCLUDED_APPS -> "Excluded Apps"
                                     ScreenType.INSTRUCTIONS -> "Instructions"
                                     ScreenType.BACKUP_RESTORE -> "Backup & Restore"
                                     ScreenType.WALLPAPER -> "Wallpaper Changer"
                                     ScreenType.LIVE_WALLPAPER -> "Live Wallpaper Studio"
-                                    ScreenType.DYNAMIC_NOTCH -> "Dynamic Notch"
                                     ScreenType.EQUALIZER -> "Equalizer"
                                 },
 
@@ -580,6 +699,40 @@ fun MainContentScreen(
                                     }
                                 }) {
                                     Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = onSurfaceColor)
+                                }
+                            }
+                        },
+                        actions = {
+                            if (currentScreen == ScreenType.DASHBOARD) {
+                                com.example.ui.PermissionsIconButton(
+                                    permissions = appPermissions,
+                                    tint = onSurfaceColor,
+                                    onClick = { showPermissions = true }
+                                )
+                            }
+                            if (currentScreen == ScreenType.GESTURES) {
+                                val canAddArea = extraNotchAreas.size + 1 < NotchAreas.MAX_AREAS
+                                IconButton(
+                                    onClick = {
+                                        val added = viewModel.addNotchArea(context)
+                                        if (added != null) {
+                                            selectedGestureArea = added.id
+                                            Toast.makeText(context, "Notch ${added.id} added", Toast.LENGTH_SHORT).show()
+                                        } else {
+                                            Toast.makeText(
+                                                context,
+                                                "You can add up to ${NotchAreas.MAX_AREAS} notch areas",
+                                                Toast.LENGTH_SHORT
+                                            ).show()
+                                        }
+                                    },
+                                    modifier = Modifier.testTag("add_notch_area")
+                                ) {
+                                    Icon(
+                                        Icons.Default.Add,
+                                        contentDescription = "Add notch gesture area",
+                                        tint = if (canAddArea) onSurfaceColor else onSurfaceColor.copy(alpha = 0.38f)
+                                    )
                                 }
                             }
                         },
@@ -607,7 +760,6 @@ fun MainContentScreen(
                         .padding(
                             horizontal = if (currentScreen == ScreenType.AUTOCLICK ||
                                 currentScreen == ScreenType.TEXT_ASSISTANT ||
-                                currentScreen == ScreenType.DYNAMIC_NOTCH ||
                                 currentScreen == ScreenType.WALLPAPER ||
                                 currentScreen == ScreenType.LIVE_WALLPAPER
                             ) 0.dp else 16.dp
@@ -626,12 +778,22 @@ fun MainContentScreen(
                             )
                             ScreenType.GESTURES -> GesturesTab(
                                 actions = uiState.actions,
+                                config = uiState.config,
+                                extraAreas = extraNotchAreas,
+                                selectedAreaId = selectedGestureArea,
+                                onSelectArea = { selectedGestureArea = it },
+                                onAreaSave = saveNotchArea,
+                                onRemoveArea = { id ->
+                                    viewModel.removeNotchArea(context, id)
+                                    selectedGestureArea = 1
+                                },
                                 onConfigureGesture = { editingActionGesture = it }
                             )
                             ScreenType.CALIBRATION -> CalibrationTab(
                                 config = uiState.config,
+                                extraAreas = extraNotchAreas,
                                 onConfigChange = { viewModel.updateConfig(it) },
-                                onConfigChangeDebounced = { viewModel.updateConfigDebounced(it) }
+                                onAreaSave = saveNotchArea
                             )
                             ScreenType.SIDE_DECK -> SideDeckTab(
                                 sideDeckConfig = uiState.sideDeckConfig,
@@ -666,6 +828,10 @@ fun MainContentScreen(
                             )
                             ScreenType.DEVELOPER -> DeveloperTab()
                             ScreenType.RECORDINGS -> RecordingsTab()
+                            ScreenType.VIDEO_EDITOR -> com.example.ui.VideoEditorTab()
+                            ScreenType.NIGHT_SAVER -> com.example.ui.NightBatterySaverTab()
+                            ScreenType.GAME_MODE -> com.example.ui.GameModeTab()
+                            ScreenType.WIDGET_STUDIO -> com.example.ui.WidgetStudioTab()
                             ScreenType.EXCLUDED_APPS -> ExcludedAppsTab(
                                 notchConfig = uiState.config,
                                 onConfigChange = { viewModel.updateConfig(it) }
@@ -681,18 +847,18 @@ fun MainContentScreen(
                                 onBack = { currentScreen = ScreenType.DASHBOARD }
                             )
                             ScreenType.EQUALIZER -> com.example.ui.EqualizerTab()
-                            ScreenType.DYNAMIC_NOTCH -> com.example.ui.island.DynamicNotchScreen(
-                                onBack = { currentScreen = ScreenType.DASHBOARD },
-                                config = uiState.config,
-                                onConfigChange = { viewModel.updateConfig(it) },
-                                onConfigChangeDebounced = { viewModel.updateConfigDebounced(it) },
-                                initialTab = com.example.ui.island.DynamicNotchTab.SKINS
-                            )
                         }
                     }
                 }
             }
         }
+    }
+
+    if (showPermissions) {
+        com.example.ui.PermissionsSheet(
+            permissions = appPermissions,
+            onDismiss = { showPermissions = false }
+        )
     }
 
     // Gesture Configuration Bottom Sheet/Dialog
@@ -1032,16 +1198,8 @@ fun DashboardScreen(
 
             item {
                 DashboardCard(
-                    title = "Dynamic Notch",
-                    description = "Custom skins, physics pop animations, behavior settings & capsule events.",
-                    icon = Icons.Filled.Layers,
-                    onClick = { onNavigate(ScreenType.DYNAMIC_NOTCH) }
-                )
-            }
-            item {
-                DashboardCard(
                     title = "Notch Gestures",
-                    description = "Configure custom swipe actions around your front camera.",
+                    description = "Tap, swipe & hold actions on up to 3 notch areas around your front camera.",
                     icon = Icons.Filled.TouchApp,
                     onClick = { onNavigate(ScreenType.GESTURES) }
                 )
@@ -1049,7 +1207,7 @@ fun DashboardScreen(
             item {
                 DashboardCard(
                     title = "Notch Position",
-                    description = "Adjust notch position, size, and sensitivity.",
+                    description = "Adjust the position and size of each notch gesture area.",
                     icon = Icons.Filled.GpsFixed,
                     onClick = { onNavigate(ScreenType.CALIBRATION) }
                 )
@@ -1170,6 +1328,12 @@ fun DashboardCard(
 @Composable
 fun GesturesTab(
     actions: List<GestureActionEntity>,
+    config: NotchConfigEntity,
+    extraAreas: List<NotchAreaGeometry>,
+    selectedAreaId: Int,
+    onSelectArea: (Int) -> Unit,
+    onAreaSave: (NotchAreaGeometry, Boolean) -> Unit,
+    onRemoveArea: (Int) -> Unit,
     onConfigureGesture: (String) -> Unit
 ) {
     val gestureIcons = mapOf(
@@ -1194,25 +1358,24 @@ fun GesturesTab(
         "SWIPE_RIGHT_AND_HOLD" to "Swipe Right & Hold"
     )
 
-    val visibleActions = remember(actions) {
-        val gestureOrder = listOf(
-            "SINGLE_TAP",
-            "DOUBLE_TAP",
-            "TRIPLE_TAP",
-            "LONG_PRESS",
-            "SWIPE_LEFT",
-            "SWIPE_RIGHT",
-            "SWIPE_LEFT_AND_HOLD",
-            "SWIPE_RIGHT_AND_HOLD"
-        )
-        actions
-            .filter { it.gestureName != "SWIPE_DOWN" }
-            .sortedBy { val idx = gestureOrder.indexOf(it.gestureName); if (idx != -1) idx else 99 }
+    val allAreas = remember(config, extraAreas) { listOf(config.toAreaGeometry()) + extraAreas }
+    val activeAreaId = if (allAreas.any { it.id == selectedAreaId }) selectedAreaId else 1
+    var showGeometry by rememberSaveable { mutableStateOf(false) }
+    // While the position & size section is open, mark the real area positions on the screen
+    com.example.ui.NotchLivePreviewEffect(enabled = showGeometry, selectedAreaId = activeAreaId)
+
+    // One row per gesture of the selected notch area (missing rows count as "no action")
+    val areaActions = remember(actions, activeAreaId) {
+        NotchAreas.GESTURE_NAMES.map { gesture ->
+            val key = NotchAreas.actionKey(activeAreaId, gesture)
+            actions.firstOrNull { it.gestureName == key }
+                ?: GestureActionEntity(gestureName = key, actionType = "NONE", label = "Disabled (No Action)")
+        }
     }
 
     val context = LocalContext.current
-    val hasBrightnessAction = remember(visibleActions) {
-        visibleActions.any { it.actionType in listOf("BRIGHTNESS_UP", "BRIGHTNESS_DOWN", "CUSTOM_BRIGHTNESS") }
+    val hasBrightnessAction = remember(actions) {
+        actions.any { it.actionType in listOf("BRIGHTNESS_UP", "BRIGHTNESS_DOWN", "CUSTOM_BRIGHTNESS") }
     }
     val isWriteSettingsOk = remember(context) { isWriteSettingsGranted(context) }
 
@@ -1273,18 +1436,118 @@ fun GesturesTab(
             }
         }
 
-        items(visibleActions, key = { it.gestureName }) { gestureAction ->
-            val gestureName = gestureAction.gestureName
-            val icon = gestureIcons[gestureName] ?: Icons.Default.Adjust
-            val prettyName = gestureLabels[gestureName] ?: gestureName
+        // Notch area selector. The + icon in the top bar adds a new area (maximum 3).
+        item {
+            Column(modifier = Modifier.padding(bottom = 4.dp)) {
+                Text(
+                    text = "Notch areas (${allAreas.size}/${NotchAreas.MAX_AREAS})",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Text(
+                    text = if (allAreas.size < NotchAreas.MAX_AREAS) {
+                        "Each area has its own gestures, position and size. Tap + at the top to add another area."
+                    } else {
+                        "Each area has its own gestures, position and size. Maximum areas reached."
+                    },
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                com.example.ui.NotchAreaChipsRow(
+                    areaIds = allAreas.map { it.id },
+                    selectedId = activeAreaId,
+                    onSelect = onSelectArea
+                )
+            }
+        }
+
+        // Position & size of the selected area (collapsible)
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(14.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f)),
+                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+            ) {
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { showGeometry = !showGeometry }
+                            .padding(horizontal = 14.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.GpsFixed,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Position & Size - Notch $activeAreaId",
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                            val g = allAreas.first { it.id == activeAreaId }
+                            Text(
+                                text = "${g.widthDp} x ${g.heightDp} dp  \u2022  X ${g.xOffsetDp}, Y ${g.yOffsetDp}",
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Icon(
+                            imageVector = if (showGeometry) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                            contentDescription = if (showGeometry) "Collapse" else "Expand",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    if (showGeometry) {
+                        Column(modifier = Modifier.padding(start = 14.dp, end = 14.dp, bottom = 14.dp)) {
+                            com.example.ui.NotchAreaEditor(
+                                allAreas = allAreas,
+                                selectedId = activeAreaId,
+                                showPreview = false,
+                                onChange = { onAreaSave(it, false) },
+                                onCommit = { onAreaSave(it, true) }
+                            )
+                            if (activeAreaId > 1) {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                OutlinedButton(
+                                    onClick = { onRemoveArea(activeAreaId) },
+                                    shape = RoundedCornerShape(12.dp),
+                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Icon(Icons.Default.Delete, contentDescription = null, modifier = Modifier.size(18.dp))
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text("Remove Notch $activeAreaId")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        items(areaActions, key = { it.gestureName }) { gestureAction ->
+            val gestureKey = gestureAction.gestureName
+            val baseGesture = NotchAreas.gestureOfKey(gestureKey)
+            val icon = gestureIcons[baseGesture] ?: Icons.Default.Adjust
+            val prettyName = gestureLabels[baseGesture] ?: baseGesture
             val isConfigured = gestureAction.actionType != "NONE"
             val actionDesc = getActionDescription(gestureAction)
 
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable { onConfigureGesture(gestureName) }
-                    .testTag("gesture_item_$gestureName"),
+                    .clickable { onConfigureGesture(gestureKey) }
+                    .testTag("gesture_item_$gestureKey"),
                 shape = RoundedCornerShape(14.dp),
                 colors = CardDefaults.cardColors(
                     containerColor = if (isConfigured) MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f) else MaterialTheme.colorScheme.surface.copy(alpha = 0.6f)
@@ -1348,7 +1611,7 @@ fun GesturesTab(
 }
 
 fun getActionDescription(entity: GestureActionEntity): String {
-    val isHold = entity.gestureName in listOf("LONG_PRESS", "SWIPE_LEFT_AND_HOLD", "SWIPE_RIGHT_AND_HOLD")
+    val isHold = NotchAreas.gestureOfKey(entity.gestureName) in listOf("LONG_PRESS", "SWIPE_LEFT_AND_HOLD", "SWIPE_RIGHT_AND_HOLD")
     return when (entity.actionType) {
         "BACK" -> "Go Back"
         "HOME" -> "Go Home"
@@ -1376,6 +1639,23 @@ fun getActionDescription(entity: GestureActionEntity): String {
         "WALLPAPER_LOCK_NEXT" -> "Next Lock Screen Wallpaper"
         "WALLPAPER_IMAGES_NEXT" -> "Next Wallpaper (Selected Images)"
         "WALLPAPER_FOLDER_NEXT" -> "Next Wallpaper (Folder)"
+        "OPEN_EDITOR" -> "Open Widget Editor"
+        "OPEN_URL" -> "Open link: ${WebLinkHelper.displayName(entity.extraValue)}"
+        "TEMP_LOCK_WALLPAPER" -> "Lock wallpaper for 2 minutes"
+        "OPEN_NOTES" -> "Open quick notes"
+        "TOGGLE_NOTCH" -> "Turn notch gestures on / off"
+        "TOGGLE_SIDE_DECK" -> "Turn Side Deck on / off"
+        "TOGGLE_OTP" -> "Turn Code Detector on / off"
+        "TOGGLE_TEXT_ASSISTANT" -> "Turn Text Assistant on / off"
+        "TOGGLE_EQUALIZER" -> "Turn Equalizer on / off"
+        "WALLPAPER_CHANGER_TOGGLE" -> "Turn Wallpaper Changer on / off"
+        "LIVE_WALLPAPER_NEXT" -> "Next Live Wallpaper"
+        "STOP_SPY_CAM" -> "Stop silent recording"
+        "AUTOCLICK_MENU_TOGGLE" -> "Show / hide Auto Click menu"
+        "AUTOCLICK_START" -> "Start Auto Click"
+        "AUTOCLICK_STOP" -> "Stop Auto Click"
+        "AUTOCLICK_TOGGLE" -> "Start / stop Auto Click"
+        "QUICK_DIAL" -> entity.label.ifBlank { "Quick dial" }
         else -> "Disabled (No Action)"
     }
 }
@@ -1383,15 +1663,15 @@ fun getActionDescription(entity: GestureActionEntity): String {
 @Composable
 fun CalibrationTab(
     config: NotchConfigEntity,
+    extraAreas: List<NotchAreaGeometry>,
     onConfigChange: (NotchConfigEntity) -> Unit,
-    onConfigChangeDebounced: ((NotchConfigEntity) -> Unit)? = null
+    onAreaSave: (NotchAreaGeometry, Boolean) -> Unit
 ) {
-    com.example.ui.island.DynamicNotchScreen(
-        onBack = {},
+    com.example.ui.NotchPositionScreen(
         config = config,
+        extraAreas = extraAreas,
         onConfigChange = onConfigChange,
-        onConfigChangeDebounced = onConfigChangeDebounced,
-        initialTab = com.example.ui.island.DynamicNotchTab.POSITION
+        onAreaSave = onAreaSave
     )
 }
 
@@ -2438,7 +2718,18 @@ fun ActionPickerSheet(
     onActionSelected: (String, String?, String, String?) -> Unit
 ) {
     val context = LocalContext.current
-    var selectedCategory by remember { mutableStateOf(0) } // 0: System, 1: Brightness, 2: Open App, 3: Shortcuts
+    // gestureName is the stored key ("SINGLE_TAP", or "A2_SINGLE_TAP" for notch area 2); the plain gesture drives the texts
+    val baseGesture = NotchAreas.gestureOfKey(gestureName)
+    val areaId = NotchAreas.areaOfKey(gestureName)
+    // The picker opens on a single list of categories; a category (or a form such as Web Link) opens on click
+    var screen by remember { mutableStateOf("HOME") }
+    val selectedCategory = when (screen) {
+        "APPS" -> 1
+        "SHORTCUTS" -> 2
+        "WEB" -> 3
+        "DIAL", "LOCKWP" -> 4
+        else -> 0
+    }
     var appSearchQuery by remember { mutableStateOf("") }
     var customBrightnessSlider by remember {
         mutableFloatStateOf(
@@ -2460,7 +2751,7 @@ fun ActionPickerSheet(
         "SWIPE_LEFT_AND_HOLD" to "Swipe Left & Hold",
         "SWIPE_RIGHT_AND_HOLD" to "Swipe Right & Hold"
     )
-    val prettyGesture = gestureLabels[gestureName] ?: gestureName
+    val prettyGesture = (gestureLabels[baseGesture] ?: baseGesture) + if (areaId > 1) " (Notch $areaId)" else ""
 
     // Query installed launcher apps (cached in-memory, loads only when Open App category is visited)
     val installedApps by produceState<List<AppEntry>>(initialValue = AppInfoCache.cachedLauncherApps ?: emptyList(), selectedCategory) {
@@ -2523,10 +2814,11 @@ fun ActionPickerSheet(
         Triple("SPY_CAM_BACK", null, "Spy Cam (Silent Back Record)"),
         Triple("SPY_CAM_FRONT", null, "Spy Cam (Silent Front Record)"),
         Triple("VOLUME_UP", null, "Raise Music Volume"),
-        Triple("VOLUME_DOWN", null, "Lower Music Volume")
+        Triple("VOLUME_DOWN", null, "Lower Music Volume"),
+        Triple("OPEN_EDITOR", null, "Open Widget Editor")
     )
 
-    val categories = listOf("System", "Open App", "Shortcuts")
+    val categories = listOf("System", "Open App", "Shortcuts", "Web Link", "More")
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -2559,279 +2851,49 @@ fun ActionPickerSheet(
                     .fillMaxWidth()
                     .heightIn(max = 540.dp)
             ) {
-                // Category Tabs
-                PrimaryTabRow(
-                    selectedTabIndex = selectedCategory,
-                    containerColor = Color.Transparent,
-                    contentColor = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.padding(bottom = 12.dp)
-                ) {
-                    categories.forEachIndexed { index, title ->
-                        Tab(
-                            selected = selectedCategory == index,
-                            onClick = { selectedCategory = index },
-                            text = {
-                                Text(
-                                    text = title,
-                                    fontSize = 12.sp,
-                                    fontWeight = if (selectedCategory == index) FontWeight.Bold else FontWeight.Normal
-                                )
-                            }
-                        )
-                    }
+                if (screen != "HOME") {
+                    PickerScreenHeader(
+                        title = pickerScreenTitle(screen),
+                        onBack = { screen = "HOME" }
+                    )
                 }
 
                 // Category Contents
+                androidx.activity.compose.BackHandler(enabled = screen != "HOME") { screen = "HOME" }
                 when (selectedCategory) {
                     0 -> {
-                        // System Actions
-                        val isHold = gestureName in listOf("LONG_PRESS", "SWIPE_LEFT_AND_HOLD", "SWIPE_RIGHT_AND_HOLD")
-                        val isWriteGranted = remember(context) { isWriteSettingsGranted(context) }
-                        
-                        LazyColumn(
-                            verticalArrangement = Arrangement.spacedBy(6.dp),
-                            modifier = Modifier.fillMaxWidth().weight(1f)
-                        ) {
-                            items(systemActions, key = { it.first }) { (type, pkg, label) ->
-                                val isSelected = currentAction == type
-                                val sub = when (type) {
-                                    "NONE" -> "No gesture action"
-                                    "VOLUME_UP" -> if (isHold) "Raise Volume • Supports continuous hold-to-repeat (accelerates in 2s)" else "Raise Music Volume"
-                                    "VOLUME_DOWN" -> if (isHold) "Lower Volume • Supports continuous hold-to-repeat (accelerates in 2s)" else "Lower Music Volume"
-                                    else -> "System navigation"
-                                }
-                                ActionRowItem(
-                                    title = label,
-                                    subtitle = sub,
-                                    isSelected = isSelected,
-                                    onClick = { onActionSelected(type, null, label, null) }
-                                )
-                            }
-                            
-                            // BRIGHTNESS SECTION
-                            if (!isWriteGranted) {
-                                item {
-                                    Card(
-                                        shape = RoundedCornerShape(14.dp),
-                                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.5f)),
-                                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.5f))
-                                    ) {
-                                        Row(
-                                            modifier = Modifier.padding(12.dp),
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            Column(modifier = Modifier.weight(1f)) {
-                                                Text("Permission Needed", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
-                                                Text("Allow 'Modify system settings' for brightness gestures to work.", fontSize = 11.sp, color = MaterialTheme.colorScheme.onErrorContainer)
-                                            }
-                                            Spacer(modifier = Modifier.width(8.dp))
-                                            Button(
-                                                onClick = {
-                                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                                                        try {
-                                                            context.startActivity(
-                                                                Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS).apply {
-                                                                    data = Uri.parse("package:${context.packageName}")
-                                                                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                                                }
-                                                            )
-                                                        } catch (_: Exception) {}
-                                                    }
-                                                },
-                                                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
-                                                shape = CircleShape,
-                                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
-                                            ) {
-                                                Text("Grant", fontSize = 11.sp, color = MaterialTheme.colorScheme.onError)
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            // 1. Increase Brightness
-                            item {
-                                val isSelected = currentAction == "BRIGHTNESS_UP"
-                                ActionRowItem(
-                                    title = "Increase Brightness",
-                                    subtitle = if (isHold) "Steps brightness up • Supports continuous hold-to-repeat (accelerates in 2s)" else "Steps brightness up by 8% on every gesture trigger",
-                                    isSelected = isSelected,
-                                    onClick = {
-                                        onActionSelected("BRIGHTNESS_UP", null, "Increase Brightness", null)
-                                    }
-                                )
-                            }
-
-                            // 2. Decrease Brightness
-                            item {
-                                val isSelected = currentAction == "BRIGHTNESS_DOWN"
-                                ActionRowItem(
-                                    title = "Decrease Brightness",
-                                    subtitle = if (isHold) "Steps brightness down • Supports continuous hold-to-repeat (accelerates in 2s)" else "Steps brightness down by 8% on every gesture trigger",
-                                    isSelected = isSelected,
-                                    onClick = {
-                                        onActionSelected("BRIGHTNESS_DOWN", null, "Decrease Brightness", null)
-                                    }
-                                )
-                            }
-
-                            // 3. Custom Brightness
-                            item {
-                                Card(
-                                    shape = RoundedCornerShape(16.dp),
-                                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f)),
-                                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.3f)),
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    Column(modifier = Modifier.padding(14.dp)) {
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth(),
-                                            horizontalArrangement = Arrangement.SpaceBetween,
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            Text(
-                                                text = "Custom Brightness",
-                                                fontWeight = FontWeight.Bold,
-                                                fontSize = 14.sp,
-                                                color = MaterialTheme.colorScheme.onSurface
-                                            )
-                                            Text(
-                                                text = "${customBrightnessSlider.roundToInt()}%",
-                                                fontWeight = FontWeight.ExtraBold,
-                                                fontSize = 16.sp,
-                                                color = MaterialTheme.colorScheme.primary
-                                            )
-                                        }
-
-                                        Text(
-                                            text = "Instantly set the screen to this exact level when touched",
-                                            fontSize = 11.sp,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                            modifier = Modifier.padding(top = 2.dp, bottom = 8.dp)
-                                        )
-
-                                        Slider(
-                                            value = customBrightnessSlider,
-                                            onValueChange = { customBrightnessSlider = it },
-                                            valueRange = 5f..100f,
-                                            steps = 18,
-                                            colors = SliderDefaults.colors(
-                                                thumbColor = MaterialTheme.colorScheme.primary,
-                                                activeTrackColor = MaterialTheme.colorScheme.primary,
-                                                inactiveTrackColor = MaterialTheme.colorScheme.surfaceVariant
-                                            )
-                                        )
-
-                                        // Preset chips
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth(),
-                                            horizontalArrangement = Arrangement.SpaceBetween
-                                        ) {
-                                            listOf(10, 25, 50, 75, 100).forEach { preset ->
-                                                val isChipSelected = customBrightnessSlider.roundToInt() == preset
-                                                Box(
-                                                    modifier = Modifier
-                                                        .clip(CircleShape)
-                                                        .background(if (isChipSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant)
-                                                        .border(1.dp, if (isChipSelected) Color.Transparent else MaterialTheme.colorScheme.outlineVariant, CircleShape)
-                                                        .clickable { customBrightnessSlider = preset.toFloat() }
-                                                        .padding(horizontal = 8.dp, vertical = 4.dp),
-                                                    contentAlignment = Alignment.Center
-                                                ) {
-                                                    Text(
-                                                        text = "$preset%",
-                                                        fontSize = 11.sp,
-                                                        fontWeight = if (isChipSelected) FontWeight.Bold else FontWeight.Medium,
-                                                        color = if (isChipSelected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant
-                                                    )
+                        val isHold = baseGesture in listOf("LONG_PRESS", "SWIPE_LEFT_AND_HOLD", "SWIPE_RIGHT_AND_HOLD")
+                        if (screen == "HOME") {
+                            PickerHomeList(
+                                modifier = Modifier.weight(1f),
+                                currentAction = currentAction,
+                                onOpen = { screen = it },
+                                onPick = { type, label -> onActionSelected(type, null, label, null) }
+                            )
+                        } else {
+                            PickerOptionsGrid(
+                                modifier = Modifier.weight(1f),
+                                screen = screen,
+                                isHold = isHold,
+                                currentAction = currentAction,
+                                customBrightness = customBrightnessSlider,
+                                onCustomBrightnessChange = { customBrightnessSlider = it },
+                                isWriteGranted = remember(context) { isWriteSettingsGranted(context) },
+                                onGrantWrite = {
+                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                                        try {
+                                            context.startActivity(
+                                                Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS).apply {
+                                                    data = Uri.parse("package:${context.packageName}")
+                                                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                                                 }
-                                            }
-                                        }
-
-                                        Spacer(modifier = Modifier.height(10.dp))
-
-                                        Button(
-                                            onClick = {
-                                                val pct = customBrightnessSlider.roundToInt()
-                                                onActionSelected(
-                                                    "CUSTOM_BRIGHTNESS",
-                                                    null,
-                                                    "Set Brightness to $pct%",
-                                                    pct.toString()
-                                                )
-                                            },
-                                            modifier = Modifier.fillMaxWidth(),
-                                            shape = RoundedCornerShape(10.dp),
-                                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
-                                        ) {
-                                            Text(
-                                                text = "Save Custom Brightness (${customBrightnessSlider.roundToInt()}%)",
-                                                fontWeight = FontWeight.Bold,
-                                                fontSize = 13.sp,
-                                                color = MaterialTheme.colorScheme.onPrimary
                                             )
-                                        }
+                                        } catch (_: Exception) {}
                                     }
-                                }
-                            }
-
-                            // WALLPAPER CHANGER SECTION (Only shown for non-hold gestures as requested)
-                            if (!isHold) {
-                                item {
-                                    Card(
-                                        shape = RoundedCornerShape(14.dp),
-                                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.4f)),
-                                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.secondary.copy(alpha = 0.3f)),
-                                        modifier = Modifier.fillMaxWidth().padding(top = 10.dp, bottom = 4.dp)
-                                    ) {
-                                        Row(
-                                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            Icon(
-                                                imageVector = Icons.Default.Wallpaper,
-                                                contentDescription = null,
-                                                tint = MaterialTheme.colorScheme.secondary,
-                                                modifier = Modifier.size(20.dp)
-                                            )
-                                            Spacer(modifier = Modifier.width(10.dp))
-                                            Column {
-                                                Text(
-                                                    text = "Wallpaper Changer",
-                                                    fontWeight = FontWeight.Bold,
-                                                    fontSize = 13.sp,
-                                                    color = MaterialTheme.colorScheme.secondary
-                                                )
-                                                Text(
-                                                    text = "Trigger wallpaper changes directly via this notch gesture",
-                                                    fontSize = 11.sp,
-                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                                )
-                                            }
-                                        }
-                                    }
-                                }
-
-                                val wallpaperActions = listOf(
-                                    Triple("WALLPAPER_NEXT", "Next Wallpaper", "Cycle next wallpaper (works with active live or static wallpaper)"),
-                                    Triple("WALLPAPER_PREVIOUS", "Previous Wallpaper", "Cycle previous wallpaper (works with active live or static wallpaper)"),
-                                    Triple("WALLPAPER_RANDOM", "Random Wallpaper", "Random wallpaper (works with active live or static wallpaper)"),
-                                    Triple("WALLPAPER_HOME_NEXT", "Next Home Wallpaper", "Change only the Home screen wallpaper"),
-                                    Triple("WALLPAPER_LOCK_NEXT", "Next Lock Screen Wallpaper", "Change only the Lock screen wallpaper"),
-                                    Triple("WALLPAPER_IMAGES_NEXT", "Next Wallpaper (Selected Images)", "Cycle wallpapers from selected custom photos"),
-                                    Triple("WALLPAPER_FOLDER_NEXT", "Next Wallpaper (Folder)", "Cycle wallpapers from selected folder")
-                                )
-
-                                items(wallpaperActions, key = { it.first }) { (type, label, sub) ->
-                                    val isSelected = currentAction == type
-                                    ActionRowItem(
-                                        title = label,
-                                        subtitle = sub,
-                                        isSelected = isSelected,
-                                        onClick = { onActionSelected(type, null, label, null) }
-                                    )
-                                }
-                            }
+                                },
+                                onOpen = { screen = it },
+                                onPick = { type, label, extra -> onActionSelected(type, null, label, extra) }
+                            )
                         }
                     }
                     1 -> {
@@ -3148,6 +3210,260 @@ fun ActionPickerSheet(
                                                 }
                                             }
                                         }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    3 -> {
+                        // Web Link: opens a web page in the default browser
+                        var urlText by remember {
+                            mutableStateOf(if (currentAction == "OPEN_URL") currentExtra.orEmpty() else "")
+                        }
+                        val normalizedUrl = WebLinkHelper.normalize(urlText)
+                        val showError = urlText.isNotBlank() && normalizedUrl == null
+
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .weight(1f)
+                                .verticalScroll(rememberScrollState()),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Text(
+                                text = "Open a web link",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 14.sp,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                text = "This gesture opens the link below in your phone's default browser for quick access to a website.",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            OutlinedTextField(
+                                value = urlText,
+                                onValueChange = { urlText = it },
+                                modifier = Modifier.fillMaxWidth(),
+                                label = { Text("Web link") },
+                                placeholder = { Text("example.com or https://example.com", fontSize = 13.sp) },
+                                singleLine = true,
+                                isError = showError,
+                                supportingText = {
+                                    if (showError) Text("Enter a valid web address (http or https)")
+                                },
+                                keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                                    keyboardType = androidx.compose.ui.text.input.KeyboardType.Uri,
+                                    imeAction = androidx.compose.ui.text.input.ImeAction.Done
+                                ),
+                                leadingIcon = {
+                                    Icon(Icons.Default.Language, contentDescription = null, modifier = Modifier.size(18.dp))
+                                },
+                                shape = RoundedCornerShape(16.dp)
+                            )
+                            Button(
+                                onClick = {
+                                    val url = normalizedUrl
+                                    if (url != null) {
+                                        onActionSelected(
+                                            "OPEN_URL",
+                                            null,
+                                            "Open link: ${WebLinkHelper.displayName(url)}",
+                                            url
+                                        )
+                                    }
+                                },
+                                enabled = normalizedUrl != null,
+                                shape = RoundedCornerShape(14.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("Save Web Link", fontWeight = FontWeight.Bold)
+                            }
+                            OutlinedButton(
+                                onClick = {
+                                    if (!WebLinkHelper.open(context, normalizedUrl)) {
+                                        Toast.makeText(context, "Could not open this link", Toast.LENGTH_SHORT).show()
+                                    }
+                                },
+                                enabled = normalizedUrl != null,
+                                shape = RoundedCornerShape(14.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("Test Link")
+                            }
+                        }
+                    }
+                    4 -> {
+                        // More: lock wallpaper for 2 minutes, quick notes, quick dial
+                        val scope = rememberCoroutineScope()
+                        var pickedPicture by remember {
+                            mutableStateOf(if (currentAction == "TEMP_LOCK_WALLPAPER") currentExtra else null)
+                        }
+                        val pictureBitmap = remember(pickedPicture) {
+                            pickedPicture?.let { path ->
+                                try {
+                                    android.graphics.BitmapFactory.decodeFile(
+                                        path,
+                                        android.graphics.BitmapFactory.Options().apply { inSampleSize = 8 }
+                                    )?.asImageBitmap()
+                                } catch (_: Exception) { null }
+                            }
+                        }
+                        val pictureLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+                            if (uri != null) {
+                                scope.launch {
+                                    val path = withContext(Dispatchers.IO) {
+                                        com.example.service.TempLockWallpaper.importPicture(context, uri)
+                                    }
+                                    if (path != null) {
+                                        // Drop a previously picked (unsaved) picture again
+                                        if (pickedPicture != null && pickedPicture != currentExtra) {
+                                            com.example.service.TempLockWallpaper.deletePicture(context, pickedPicture)
+                                        }
+                                        pickedPicture = path
+                                    } else {
+                                        Toast.makeText(context, "Could not use this picture", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            }
+                        }
+
+                        var dialNumber by remember {
+                            mutableStateOf(if (currentAction == "QUICK_DIAL") currentExtra else null)
+                        }
+                        var dialName by remember { mutableStateOf<String?>(null) }
+                        val contactLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+                            val data = result.data?.data
+                            if (result.resultCode == Activity.RESULT_OK && data != null) {
+                                try {
+                                    context.contentResolver.query(
+                                        data,
+                                        arrayOf(
+                                            android.provider.ContactsContract.CommonDataKinds.Phone.NUMBER,
+                                            android.provider.ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME
+                                        ),
+                                        null, null, null
+                                    )?.use { c ->
+                                        if (c.moveToFirst()) {
+                                            dialNumber = c.getString(0)
+                                            dialName = c.getString(1)
+                                        }
+                                    }
+                                } catch (_: Exception) {
+                                    Toast.makeText(context, "Could not read this contact", Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                        }
+                        val launchContactPicker = {
+                            contactLauncher.launch(
+                                Intent(
+                                    Intent.ACTION_PICK,
+                                    android.provider.ContactsContract.CommonDataKinds.Phone.CONTENT_URI
+                                )
+                            )
+                        }
+                        val callPermissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { _ ->
+                            launchContactPicker()
+                        }
+
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .weight(1f)
+                                .verticalScroll(rememberScrollState()),
+                            verticalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            // 1. Temporary lock wallpaper
+                            if (screen == "LOCKWP") Card(
+                                shape = RoundedCornerShape(16.dp),
+                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Text("Lock wallpaper for 2 minutes", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                                    Text(
+                                        "Shows the picture you choose on the lock screen for 2 minutes, then brings your old lock screen back.",
+                                        fontSize = 12.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                    if (pictureBitmap != null) {
+                                        Image(
+                                            bitmap = pictureBitmap,
+                                            contentDescription = "Selected lock wallpaper",
+                                            contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .height(120.dp)
+                                                .clip(RoundedCornerShape(12.dp))
+                                        )
+                                    }
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        OutlinedButton(
+                                            onClick = { pictureLauncher.launch("image/*") },
+                                            shape = RoundedCornerShape(12.dp),
+                                            modifier = Modifier.weight(1f)
+                                        ) { Text(if (pickedPicture == null) "Choose picture" else "Change picture") }
+                                        Button(
+                                            onClick = {
+                                                val path = pickedPicture
+                                                if (path != null) {
+                                                    if (currentAction == "TEMP_LOCK_WALLPAPER" && currentExtra != path) {
+                                                        com.example.service.TempLockWallpaper.deletePicture(context, currentExtra)
+                                                    }
+                                                    onActionSelected("TEMP_LOCK_WALLPAPER", null, "Lock wallpaper for 2 min", path)
+                                                }
+                                            },
+                                            enabled = pickedPicture != null,
+                                            shape = RoundedCornerShape(12.dp),
+                                            modifier = Modifier.weight(1f)
+                                        ) { Text("Use this") }
+                                    }
+                                }
+                            }
+
+                            // 3. Quick dial
+                            if (screen == "DIAL") Card(
+                                shape = RoundedCornerShape(16.dp),
+                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Text("Quick Dial", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                                    Text(
+                                        "Calls the contact you choose. Allow the phone permission so it can call directly; otherwise the dialer opens with the number ready.",
+                                        fontSize = 12.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                    if (!dialNumber.isNullOrBlank()) {
+                                        Text(
+                                            text = (dialName ?: "Selected number") + "  " + dialNumber,
+                                            fontSize = 13.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = MaterialTheme.colorScheme.primary
+                                        )
+                                    }
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        OutlinedButton(
+                                            onClick = {
+                                                val granted = context.checkSelfPermission(android.Manifest.permission.CALL_PHONE) ==
+                                                    android.content.pm.PackageManager.PERMISSION_GRANTED
+                                                if (granted) launchContactPicker()
+                                                else callPermissionLauncher.launch(android.Manifest.permission.CALL_PHONE)
+                                            },
+                                            shape = RoundedCornerShape(12.dp),
+                                            modifier = Modifier.weight(1f)
+                                        ) { Text(if (dialNumber.isNullOrBlank()) "Choose contact" else "Change contact") }
+                                        Button(
+                                            onClick = {
+                                                val number = dialNumber?.filter { it.isDigit() || it == '+' || it == '*' || it == '#' }
+                                                if (!number.isNullOrBlank()) {
+                                                    onActionSelected("QUICK_DIAL", null, "Call ${dialName ?: number}", number)
+                                                }
+                                            },
+                                            enabled = !dialNumber.isNullOrBlank(),
+                                            shape = RoundedCornerShape(12.dp),
+                                            modifier = Modifier.weight(1f)
+                                        ) { Text("Use this") }
                                     }
                                 }
                             }

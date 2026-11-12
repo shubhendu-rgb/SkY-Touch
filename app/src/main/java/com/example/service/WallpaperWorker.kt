@@ -14,6 +14,7 @@ import com.example.data.AppDatabase
 import com.example.data.WallpaperConfigEntity
 import com.example.service.wallpaper.DefaultWallpaperManager
 import com.example.service.wallpaper.StaticImageEditStore
+import com.example.util.QuietHours
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.util.Calendar
@@ -37,9 +38,16 @@ class WallpaperWorker(
                 return@withContext Result.failure()
             }
 
-            val applied = applyWallpaperForConfig(context, config)
-            if (!applied) {
-                return@withContext Result.failure()
+            // "Pause from time to time": inside the user's pause window the automatic change is skipped.
+            // The schedule below still continues, so changes resume by themselves when the window ends.
+            val inPauseWindow = QuietHours.isActiveNow(context, screenType) ||
+                QuietHours.isActiveNow(context, QuietHours.NIGHT_SAVER) ||
+                com.example.util.GameMode.isActive()
+            if (!inPauseWindow) {
+                val applied = applyAutoChange(context, config)
+                if (!applied) {
+                    return@withContext Result.failure()
+                }
             }
 
             // If we are using exact time scheduling, we need to schedule the next day's work manually
@@ -72,9 +80,10 @@ class WallpaperWorker(
             customOffsetY: Float = 0f
         ): Bitmap? {
             try {
+                // Guarantee true physical portrait dimensions regardless of whether phone is temporarily held in landscape
                 val displayMetrics = context.resources.displayMetrics
-                val screenWidth = displayMetrics.widthPixels
-                val screenHeight = displayMetrics.heightPixels
+                val screenWidth = minOf(displayMetrics.widthPixels, displayMetrics.heightPixels)
+                val screenHeight = maxOf(displayMetrics.widthPixels, displayMetrics.heightPixels)
 
                 // If scrollable, use wide width for launcher parallax scrolling
                 val targetWidth = if (isScrollable) (screenWidth * 2) else screenWidth
@@ -568,6 +577,32 @@ class WallpaperWorker(
             return candidates
         }
 
+        /**
+         * Automatic change (timer / schedule) following the user's "source" and "next / random" choice for
+         * this screen. If the chosen source has no pictures it falls back to all sources, so the changer
+         * never silently stops.
+         */
+        suspend fun applyAutoChange(context: Context, config: WallpaperConfigEntity): Boolean =
+            withContext(Dispatchers.IO) {
+                try {
+                    val rule = WallpaperRules.loadAuto(context, config.screenType)
+                    var filter = rule.sourceFilter
+                    var pool = collectAllCandidateUris(context, config, filter)
+                    if (pool.isEmpty() && filter != null) {
+                        filter = null
+                        pool = collectAllCandidateUris(context, config, null)
+                    }
+                    if (pool.isEmpty()) return@withContext false
+                    val prefs = context.getSharedPreferences("wallpaper_cycle_prefs", Context.MODE_PRIVATE)
+                    val direction = if (rule.order == WallpaperRules.ORDER_RANDOM) "RANDOM" else "NEXT"
+                    val uri = pickUri(prefs, "idx_AUTO_${config.screenType}_${filter ?: "ALL"}", pool, direction)
+                    applyUriToConfigs(context, uri, listOf(config))
+                } catch (e: Exception) {
+                    Log.e("WallpaperWorker", "Auto change failed for ${config.screenType}: ${e.message}", e)
+                    false
+                }
+            }
+
         suspend fun applyWallpaperForConfig(
             context: Context,
             config: WallpaperConfigEntity,
@@ -582,21 +617,23 @@ class WallpaperWorker(
                 }
 
                 val selectedUri = candidateUris.random()
+                val isScroll = if (config.screenType == "LOCK") false else config.isScrollable
                 val bitmap = processBitmap(
                     context = context,
                     uri = selectedUri,
                     applyGradient = config.applyGradient,
                     applyGrayscale = config.applyGrayscale,
                     cropAlignment = config.cropAlignment,
-                    isScrollable = config.isScrollable,
+                    isScrollable = isScroll,
                     blurRadius = config.blurRadius
                 )
 
                 if (bitmap != null) {
                     val wallpaperManager = WallpaperManager.getInstance(context)
                     val flag = if (config.screenType == "LOCK") WallpaperManager.FLAG_LOCK else WallpaperManager.FLAG_SYSTEM
-                    wallpaperManager.setBitmap(bitmap, null, false, flag)
-                    Log.i("WallpaperWorker", "Applied wallpaper for ${config.screenType} (align=${config.cropAlignment}, scroll=${config.isScrollable}) from $selectedUri")
+                    val cropHint = Rect(0, 0, bitmap.width, bitmap.height)
+                    wallpaperManager.setBitmap(bitmap, cropHint, false, flag)
+                    Log.i("WallpaperWorker", "Applied wallpaper for ${config.screenType} (align=${config.cropAlignment}, scroll=$isScroll) from $selectedUri")
                     return@withContext true
                 }
                 false
@@ -726,14 +763,15 @@ class WallpaperWorker(
                 applyGradient = config.applyGradient,
                 applyGrayscale = config.applyGrayscale,
                 cropAlignment = config.cropAlignment,
-                isScrollable = config.isScrollable,
+                isScrollable = if (config.screenType == "LOCK") false else config.isScrollable,
                 blurRadius = config.blurRadius
             )
 
             if (configs.size > 1 && configs.all { sameLook(it, first) }) {
                 val bitmap = process(first) ?: return false
+                val cropHint = Rect(0, 0, bitmap.width, bitmap.height)
                 wallpaperManager.setBitmap(
-                    bitmap, null, false,
+                    bitmap, cropHint, false,
                     WallpaperManager.FLAG_SYSTEM or WallpaperManager.FLAG_LOCK
                 )
                 return true
@@ -743,7 +781,8 @@ class WallpaperWorker(
             for (config in configs) {
                 val bitmap = process(config) ?: continue
                 val flag = if (config.screenType == "LOCK") WallpaperManager.FLAG_LOCK else WallpaperManager.FLAG_SYSTEM
-                wallpaperManager.setBitmap(bitmap, null, false, flag)
+                val cropHint = Rect(0, 0, bitmap.width, bitmap.height)
+                wallpaperManager.setBitmap(bitmap, cropHint, false, flag)
                 ok = true
             }
             return ok
@@ -776,7 +815,8 @@ class WallpaperWorker(
                 if (bitmap != null) {
                     val wallpaperManager = WallpaperManager.getInstance(context)
                     val flag = if (config.screenType == "LOCK") WallpaperManager.FLAG_LOCK else WallpaperManager.FLAG_SYSTEM
-                    wallpaperManager.setBitmap(bitmap, null, false, flag)
+                    val cropHint = Rect(0, 0, bitmap.width, bitmap.height)
+                    wallpaperManager.setBitmap(bitmap, cropHint, false, flag)
                     Log.i("WallpaperWorker", "Successfully applied specific wallpaper for ${config.screenType} with blur=${config.blurRadius}")
                     return@withContext true
                 }
@@ -791,7 +831,12 @@ class WallpaperWorker(
             val workManager = WorkManager.getInstance(context)
             val workName = "AutoWallpaperWork_${config.screenType}"
             
-            if (!config.isEnabled) {
+            // Changer switched off, or Night Battery Saver is active: never keep a job scheduled
+            // (NightSaver / DefaultWallpaperManager.resumeAll bring it back when it is allowed again).
+            if (!config.isEnabled ||
+                DefaultWallpaperManager.isPaused(context) ||
+                com.example.util.NightSaver.isActive(context)
+            ) {
                 workManager.cancelUniqueWork(workName)
                 return
             }
@@ -832,8 +877,14 @@ class WallpaperWorker(
                     workManager.enqueueUniquePeriodicWork(workName, ExistingPeriodicWorkPolicy.UPDATE, request)
                 } else {
                     // Less than 15 mins (WorkManager minimum) -> Use OneTime chaining
+                    // If the pause window is active, wait until it ends instead of waking up every few minutes
+                    val intervalMs = TimeUnit.MINUTES.toMillis(config.intervalMinutes.toLong())
+                    val pauseLeftMs = maxOf(
+                        QuietHours.millisUntilEnd(context, config.screenType),
+                        QuietHours.millisUntilEnd(context, QuietHours.NIGHT_SAVER)
+                    )
                     val request = OneTimeWorkRequestBuilder<WallpaperWorker>()
-                        .setInitialDelay(config.intervalMinutes.toLong(), TimeUnit.MINUTES)
+                        .setInitialDelay(maxOf(intervalMs, pauseLeftMs), TimeUnit.MILLISECONDS)
                         .setInputData(data)
                         .build()
                     workManager.enqueueUniqueWork(workName, ExistingWorkPolicy.REPLACE, request)

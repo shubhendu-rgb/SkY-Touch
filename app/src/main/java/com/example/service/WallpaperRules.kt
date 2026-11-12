@@ -101,4 +101,32 @@ object WallpaperRules {
                 "Gestures named \"Home\" or \"Lock Screen\" always change just that screen."
         }
     }
+
+    // ---- Automatic wallpaper changer (per screen): where pictures come from and in which order ----
+    // Stored in SharedPreferences too (no database change). Default = both sources, random: the old behavior.
+    data class AutoRule(
+        val source: String = SOURCE_ANY,
+        val order: String = ORDER_RANDOM
+    ) {
+        val sourceFilter: String? get() = if (source == SOURCE_ANY) null else source
+    }
+
+    private const val AUTO_PREFS = "wallpaper_auto_rule_prefs"
+
+    fun loadAuto(context: Context, screenType: String): AutoRule {
+        val p = context.applicationContext.getSharedPreferences(AUTO_PREFS, Context.MODE_PRIVATE)
+        val source = p.getString("${screenType}_source", SOURCE_ANY) ?: SOURCE_ANY
+        val order = p.getString("${screenType}_order", ORDER_RANDOM) ?: ORDER_RANDOM
+        return AutoRule(
+            source = if (source in listOf(SOURCE_ANY, SOURCE_IMAGES, SOURCE_FOLDER)) source else SOURCE_ANY,
+            order = if (order == ORDER_SEQUENTIAL) ORDER_SEQUENTIAL else ORDER_RANDOM
+        )
+    }
+
+    fun saveAuto(context: Context, screenType: String, rule: AutoRule) {
+        context.applicationContext.getSharedPreferences(AUTO_PREFS, Context.MODE_PRIVATE).edit()
+            .putString("${screenType}_source", rule.source)
+            .putString("${screenType}_order", rule.order)
+            .apply()
+    }
 }

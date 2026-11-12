@@ -203,75 +203,62 @@ fun LiveWallpaperTab(
         }
     }
 
-    // Picker for GIF images
-    val gifPickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.PickVisualMedia()
-    ) { uri: Uri? ->
-        if (uri != null) {
-            scope.launch {
+    // Imports every picked file (GIFs and videos), one after the other, then refreshes the saved list once.
+    // The last imported item becomes the preview; tapping its apply icon puts it on the phone.
+    fun importPickedMedia(uris: List<Uri>, forceVideoDefault: Boolean) {
+        if (uris.isEmpty()) return
+        scope.launch {
+            var added = 0
+            var failed = 0
+            var lastAdded: LiveWallpaperConfig? = null
+            val stamp = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
+            for (uri in uris) {
                 val mime = try { context.contentResolver.getType(uri) } catch (_: Exception) { null } ?: ""
-                val isRealVideo = mime.startsWith("video/")
+                val isRealVideo = if (forceVideoDefault) (mime.startsWith("video/") || !mime.contains("gif")) else mime.startsWith("video/")
                 val file = withContext(Dispatchers.IO) {
                     LiveWallpaperManager.importMediaFile(context, uri, isVideo = isRealVideo)
                 }
-                if (file != null) {
-                    val actualType = if (isRealVideo) LiveMediaType.VIDEO else LiveMediaType.GIF
-                    val namePrefix = if (isRealVideo) "Custom Video" else "Custom GIF"
-                    val updated = activeConfig.copy(
-                        id = UUID.randomUUID().toString(),
-                        title = "$namePrefix ${SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())}",
-                        mediaType = actualType,
-                        mediaPath = file.absolutePath,
-                        scaleFactor = 1.0f,
-                        offsetX = 0f,
-                        offsetY = 0f,
-                        dateAdded = System.currentTimeMillis()
-                    )
-                    activeConfig = updated
-                    LiveWallpaperManager.addToSavedList(context, updated)
-                    savedList = LiveWallpaperManager.getSavedList(context)
-                    Toast.makeText(context, "$namePrefix added. Tap the apply icon to use it.", Toast.LENGTH_SHORT).show()
-                } else {
-                    Toast.makeText(context, "Failed to import media file", Toast.LENGTH_SHORT).show()
-                }
+                if (file == null) { failed++; continue }
+                val actualType = if (isRealVideo) LiveMediaType.VIDEO else LiveMediaType.GIF
+                val namePrefix = if (isRealVideo) "Custom Video" else "Custom GIF"
+                val title = if (uris.size > 1) "$namePrefix $stamp #${added + 1}" else "$namePrefix $stamp"
+                val item = activeConfig.copy(
+                    id = UUID.randomUUID().toString(),
+                    title = title,
+                    mediaType = actualType,
+                    mediaPath = file.absolutePath,
+                    scaleFactor = 1.0f,
+                    offsetX = 0f,
+                    offsetY = 0f,
+                    dateAdded = System.currentTimeMillis() + added
+                )
+                LiveWallpaperManager.addToSavedList(context, item)
+                lastAdded = item
+                added++
             }
+            if (lastAdded != null) {
+                activeConfig = lastAdded
+                savedList = LiveWallpaperManager.getSavedList(context)
+            }
+            val msg = when {
+                added == 0 -> "Failed to import media file"
+                failed > 0 -> "$added added, $failed failed. Tap the apply icon to use one."
+                added == 1 -> "Added. Tap the apply icon to use it."
+                else -> "$added added. Tap the apply icon on the one you want."
+            }
+            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
         }
     }
 
-    // Picker for Small Videos
+    // Picker for GIF images: pick as many as you want in one go
+    val gifPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickMultipleVisualMedia()
+    ) { uris: List<Uri> -> importPickedMedia(uris, forceVideoDefault = false) }
+
+    // Picker for small videos: also multiple
     val videoPickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.PickVisualMedia()
-    ) { uri: Uri? ->
-        if (uri != null) {
-            scope.launch {
-                val mime = try { context.contentResolver.getType(uri) } catch (_: Exception) { null } ?: ""
-                val isRealVideo = mime.startsWith("video/") || !mime.contains("gif")
-                val file = withContext(Dispatchers.IO) {
-                    LiveWallpaperManager.importMediaFile(context, uri, isVideo = isRealVideo)
-                }
-                if (file != null) {
-                    val actualType = if (isRealVideo) LiveMediaType.VIDEO else LiveMediaType.GIF
-                    val namePrefix = if (isRealVideo) "Custom Video" else "Custom GIF"
-                    val updated = activeConfig.copy(
-                        id = UUID.randomUUID().toString(),
-                        title = "$namePrefix ${SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())}",
-                        mediaType = actualType,
-                        mediaPath = file.absolutePath,
-                        scaleFactor = 1.0f,
-                        offsetX = 0f,
-                        offsetY = 0f,
-                        dateAdded = System.currentTimeMillis()
-                    )
-                    activeConfig = updated
-                    LiveWallpaperManager.addToSavedList(context, updated)
-                    savedList = LiveWallpaperManager.getSavedList(context)
-                    Toast.makeText(context, "$namePrefix added. Tap the apply icon to use it.", Toast.LENGTH_SHORT).show()
-                } else {
-                    Toast.makeText(context, "Failed to import media file", Toast.LENGTH_SHORT).show()
-                }
-            }
-        }
-    }
+        contract = ActivityResultContracts.PickMultipleVisualMedia()
+    ) { uris: List<Uri> -> importPickedMedia(uris, forceVideoDefault = true) }
 
     Box(
         modifier = Modifier
@@ -290,6 +277,7 @@ fun LiveWallpaperTab(
                         VideoTexturePreview(
                             videoPath = path,
                             isMuted = activeConfig.isMuted,
+                            volume = activeConfig.volume,
                             playbackSpeed = activeConfig.playbackSpeed,
                             colorFilter = composeColorFilter,
                             contentScale = when (activeConfig.cropMode) {
@@ -843,6 +831,7 @@ fun LiveWallpaperPreviewCard(
                                 VideoTexturePreview(
                                     videoPath = path,
                                     isMuted = config.isMuted,
+                                    volume = config.volume,
                                     playbackSpeed = config.playbackSpeed,
                                     colorFilter = composeColorFilter,
                                     contentScale = scale,
@@ -956,11 +945,15 @@ fun LiveWallpaperPreviewCard(
 fun VideoTexturePreview(
     videoPath: String,
     isMuted: Boolean,
+    volume: Float = 0.5f,
     playbackSpeed: Float,
     colorFilter: ColorFilter?,
     contentScale: ContentScale,
     modifier: Modifier = Modifier
 ) {
+    // A new video = a new player. Without the key the TextureView and its player were created once for the first
+    // video and kept showing it when another video wallpaper was selected.
+    key(videoPath) {
     AndroidView(
         factory = { ctx ->
             TextureView(ctx).apply {
@@ -1002,7 +995,7 @@ fun VideoTexturePreview(
                                 setDataSource(videoPath)
                                 setSurface(android.view.Surface(surface))
                                 isLooping = true
-                                val vol = if (isMuted) 0f else 0.5f
+                                val vol = if (isMuted) 0f else volume.coerceIn(0f, 1f)
                                 setVolume(vol, vol)
                                 setOnVideoSizeChangedListener { _, vw, vh ->
                                     videoW = vw
@@ -1063,7 +1056,7 @@ fun VideoTexturePreview(
         update = { view ->
             val player = view.getTag() as? MediaPlayer
             if (player != null) {
-                val vol = if (isMuted) 0f else 0.5f
+                val vol = if (isMuted) 0f else volume.coerceIn(0f, 1f)
                 player.setVolume(vol, vol)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                     try {
@@ -1082,6 +1075,7 @@ fun VideoTexturePreview(
         },
         modifier = modifier
     )
+    } // key(videoPath)
 }
 
 /**
@@ -1471,6 +1465,43 @@ fun EditAndCropCard(
                         onCheckedChange = { onConfigChange(config.copy(isMuted = it)) }
                     )
                 }
+
+                // Volume slider: applied live to the wallpaper and the preview (committed when released)
+                var volumeDraft by remember(config.id, config.volume) { mutableStateOf(config.volume) }
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            "Video Volume",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 14.sp,
+                            color = if (config.isMuted) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface
+                        )
+                        Text(
+                            if (config.isMuted) "Muted" else "${(volumeDraft * 100).toInt()}%",
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Slider(
+                        value = volumeDraft,
+                        onValueChange = { volumeDraft = it },
+                        onValueChangeFinished = { onConfigChange(config.copy(volume = volumeDraft)) },
+                        valueRange = 0f..1f,
+                        enabled = !config.isMuted,
+                        modifier = Modifier.testTag("slider_video_volume")
+                    )
+                    if (config.isMuted) {
+                        Text(
+                            "Turn off \"Mute Video Audio\" to use the volume.",
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
             }
         }
     }
@@ -1631,6 +1662,7 @@ fun AutoChangeLiveWallpaperCard(
                     onCheckedChange = { checked ->
                         isEnabled = checked
                         LiveWallpaperManager.setAutoChangeEnabled(context, checked)
+                        if (checked) LiveWallpaperManager.setLastAutoChangeTime(context, System.currentTimeMillis())
                         LiveWallpaperWorker.scheduleWork(context)
                         Toast.makeText(
                             context,
@@ -1665,6 +1697,7 @@ fun AutoChangeLiveWallpaperCard(
                             onCheckedChange = { sched ->
                                 useSchedule = sched
                                 LiveWallpaperManager.setAutoChangeUseSchedule(context, sched)
+                                LiveWallpaperManager.setLastAutoChangeTime(context, System.currentTimeMillis())
                                 LiveWallpaperWorker.scheduleWork(context)
                             }
                         )
@@ -1686,6 +1719,8 @@ fun AutoChangeLiveWallpaperCard(
                                     modifier = Modifier.weight(1f).clickable {
                                         intervalMins = mins
                                         LiveWallpaperManager.setAutoChangeInterval(context, mins)
+                                        // the new interval counts from now
+                                        LiveWallpaperManager.setLastAutoChangeTime(context, System.currentTimeMillis())
                                         LiveWallpaperWorker.scheduleWork(context)
                                     },
                                     shape = RoundedCornerShape(8.dp),
@@ -1789,6 +1824,11 @@ fun UnifiedWallpapersCard(
     onEditItem: ((LiveWallpaperConfig) -> Unit)? = null
 ) {
     var expandedEditId by rememberSaveable { mutableStateOf<String?>(null) }
+
+    // Selecting another wallpaper closes the edit panel of the previous one
+    LaunchedEffect(config.id) {
+        if (expandedEditId != null && expandedEditId != config.id) expandedEditId = null
+    }
 
     Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
         // 1. Unified Default Live Wallpapers & System Live Wallpapers Card
@@ -2025,7 +2065,7 @@ fun UnifiedWallpapersCard(
                     ) {
                         Icon(Icons.Default.Gif, contentDescription = null, modifier = Modifier.size(22.dp))
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("Add GIF", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                        Text("Add GIFs", fontWeight = FontWeight.Bold, fontSize = 13.sp)
                     }
 
                     FilledTonalButton(
@@ -2039,7 +2079,7 @@ fun UnifiedWallpapersCard(
                     ) {
                         Icon(Icons.Default.VideoLibrary, contentDescription = null, modifier = Modifier.size(20.dp))
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("Add Video", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                        Text("Add Videos", fontWeight = FontWeight.Bold, fontSize = 13.sp)
                     }
                 }
 
@@ -2357,6 +2397,7 @@ fun FullscreenCropPinchScreen(
                             VideoTexturePreview(
                                 videoPath = path,
                                 isMuted = config.isMuted,
+                                volume = config.volume,
                                 playbackSpeed = config.playbackSpeed,
                                 colorFilter = composeColorFilter,
                                 contentScale = ContentScale.Crop,

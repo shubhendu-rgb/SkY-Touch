@@ -67,6 +67,7 @@ import androidx.compose.ui.window.DialogProperties
 import coil.compose.AsyncImage
 import com.example.data.AppDatabase
 import com.example.data.WallpaperConfigEntity
+import com.example.service.WallpaperRules
 import com.example.service.WallpaperWorker
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -1145,6 +1146,71 @@ fun StaticWallpaperScreen(
                                             }
                                         }
                                     }
+
+                                    HorizontalDivider(color = Color.White.copy(alpha = 0.15f))
+
+                                    // Where the automatic changer takes pictures from, and in which order
+                                    var autoRule by remember(config.screenType) {
+                                        mutableStateOf(WallpaperRules.loadAuto(context, config.screenType))
+                                    }
+                                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        Text("Wallpaper source", style = MaterialTheme.typography.titleSmall, color = Color.White)
+                                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                            listOf(
+                                                WallpaperRules.SOURCE_IMAGES to "Images",
+                                                WallpaperRules.SOURCE_FOLDER to "Folder",
+                                                WallpaperRules.SOURCE_ANY to "Both"
+                                            ).forEach { (value, label) ->
+                                                FilterChip(
+                                                    selected = autoRule.source == value,
+                                                    onClick = {
+                                                        autoRule = autoRule.copy(source = value)
+                                                        WallpaperRules.saveAuto(context, config.screenType, autoRule)
+                                                    },
+                                                    label = { Text(label) },
+                                                    modifier = Modifier.testTag("auto_source_$value")
+                                                )
+                                            }
+                                        }
+                                        Text("Order", style = MaterialTheme.typography.titleSmall, color = Color.White)
+                                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                            listOf(
+                                                WallpaperRules.ORDER_SEQUENTIAL to "Next",
+                                                WallpaperRules.ORDER_RANDOM to "Random"
+                                            ).forEach { (value, label) ->
+                                                FilterChip(
+                                                    selected = autoRule.order == value,
+                                                    onClick = {
+                                                        autoRule = autoRule.copy(order = value)
+                                                        WallpaperRules.saveAuto(context, config.screenType, autoRule)
+                                                    },
+                                                    label = { Text(label) },
+                                                    modifier = Modifier.testTag("auto_order_$value")
+                                                )
+                                            }
+                                        }
+                                        Text(
+                                            when (autoRule.source) {
+                                                WallpaperRules.SOURCE_IMAGES -> "Uses only your selected images"
+                                                WallpaperRules.SOURCE_FOLDER -> "Uses only your selected folder"
+                                                else -> "Uses your selected images and folder together"
+                                            } + if (autoRule.order == WallpaperRules.ORDER_RANDOM) ", in random order." else ", one after another.",
+                                            fontSize = 11.sp,
+                                            color = Color.White.copy(alpha = 0.7f)
+                                        )
+                                    }
+
+                                    HorizontalDivider(color = Color.White.copy(alpha = 0.15f))
+
+                                    // Pause the changer between two times of day (AM / PM)
+                                    QuietHoursControls(
+                                        key = config.screenType,
+                                        title = "Pause from time to time",
+                                        description = "No automatic wallpaper change between these two times. It continues by itself after the second time.",
+                                        textColor = Color.White,
+                                        accentColor = Color(0xFF64B5F6),
+                                        onChanged = { WallpaperWorker.scheduleWallpaperWork(context, config) }
+                                    )
                                 }
                             }
                         }

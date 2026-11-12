@@ -3,4 +3,6 @@
     <string name="accessibility_service_description">SkY Touch detects clicks, double clicks, and swipes near your camera cutout to trigger fast system actions like screenshots, flashlight, back key, etc.</string>
     <string name="live_wallpaper_title">SkY Live Wallpaper</string>
     <string name="live_wallpaper_description">Dynamic GIF and video live wallpaper with rotation, crop and custom color filters.</string>
+    <string name="sky_widget_title">SkY Touch Widget</string>
+    <string name="sky_widget_description">Fully customisable clock widget: move and resize every part, change colours, use Material You colours.</string>
 </resources>

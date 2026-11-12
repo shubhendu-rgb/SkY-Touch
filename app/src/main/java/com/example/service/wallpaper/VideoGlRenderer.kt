@@ -640,40 +640,55 @@ class VideoGlRenderer(
     }
 
     fun release() {
+        if (!isRunning && eglDisplay == EGL14.EGL_NO_DISPLAY) return
         isRunning = false
         isContextMadeCurrent = false
         lastBitmapWidth = -1
         lastBitmapHeight = -1
         try {
-            surfaceTexture?.release()
-            videoSurface?.release()
-            if (videoProgram != 0) {
-                GLES20.glDeleteProgram(videoProgram)
-                videoProgram = 0
+            surfaceTexture?.setOnFrameAvailableListener(null)
+        } catch (_: Exception) {}
+        val display = eglDisplay
+        try {
+            // GL delete calls act on whichever context is current on this thread. Several engines
+            // (home, lock, preview) live in this process, so make OUR context current first, otherwise
+            // we would delete the textures / programs of another engine and leave it black.
+            var ownContextCurrent = false
+            if (display != EGL14.EGL_NO_DISPLAY && eglContext != EGL14.EGL_NO_CONTEXT &&
+                eglSurface != EGL14.EGL_NO_SURFACE
+            ) {
+                ownContextCurrent = EGL14.eglMakeCurrent(display, eglSurface, eglSurface, eglContext)
             }
-            if (bitmapProgram != 0) {
-                GLES20.glDeleteProgram(bitmapProgram)
-                bitmapProgram = 0
+            if (ownContextCurrent) {
+                if (videoProgram != 0) GLES20.glDeleteProgram(videoProgram)
+                if (bitmapProgram != 0) GLES20.glDeleteProgram(bitmapProgram)
+                if (videoTextureId != -1) GLES20.glDeleteTextures(1, intArrayOf(videoTextureId), 0)
+                if (bitmapTextureId != -1) GLES20.glDeleteTextures(1, intArrayOf(bitmapTextureId), 0)
             }
-            if (videoTextureId != -1) {
-                GLES20.glDeleteTextures(1, intArrayOf(videoTextureId), 0)
-                videoTextureId = -1
-            }
-            if (bitmapTextureId != -1) {
-                GLES20.glDeleteTextures(1, intArrayOf(bitmapTextureId), 0)
-                bitmapTextureId = -1
-            }
-            if (eglDisplay != EGL14.EGL_NO_DISPLAY) {
-                EGL14.eglMakeCurrent(eglDisplay, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
+            videoProgram = 0
+            bitmapProgram = 0
+            videoTextureId = -1
+            bitmapTextureId = -1
+            try { videoSurface?.release() } catch (_: Exception) {}
+            try { surfaceTexture?.release() } catch (_: Exception) {}
+            videoSurface = null
+            surfaceTexture = null
+
+            if (display != EGL14.EGL_NO_DISPLAY) {
+                if (EGL14.eglGetCurrentContext() == eglContext) {
+                    EGL14.eglMakeCurrent(display, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
+                }
                 if (eglSurface != EGL14.EGL_NO_SURFACE) {
-                    EGL14.eglDestroySurface(eglDisplay, eglSurface)
+                    EGL14.eglDestroySurface(display, eglSurface)
                     eglSurface = EGL14.EGL_NO_SURFACE
                 }
                 if (eglContext != EGL14.EGL_NO_CONTEXT) {
-                    EGL14.eglDestroyContext(eglDisplay, eglContext)
+                    EGL14.eglDestroyContext(display, eglContext)
                     eglContext = EGL14.EGL_NO_CONTEXT
                 }
-                EGL14.eglTerminate(eglDisplay)
+                // NEVER call eglTerminate here: the default EGL display is shared by every engine in this
+                // process. Terminating it from a dying engine kills the display of the NEW engine, which
+                // shows as a black screen.
                 eglDisplay = EGL14.EGL_NO_DISPLAY
             }
         } catch (e: Exception) {

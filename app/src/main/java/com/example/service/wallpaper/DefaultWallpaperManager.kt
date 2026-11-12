@@ -2,6 +2,7 @@ package com.example.service.wallpaper
 
 import android.app.WallpaperManager
 import android.content.Context
+import android.graphics.Rect
 import android.net.Uri
 import android.util.Log
 import androidx.work.WorkManager
@@ -93,8 +94,10 @@ object DefaultWallpaperManager {
             ) ?: throw IllegalStateException("Could not read the default Lock picture")
 
             // Setting a still picture on Home also removes any live wallpaper (GIF / video / preset).
-            wm.setBitmap(homeBitmap, null, false, WallpaperManager.FLAG_SYSTEM)
-            wm.setBitmap(lockBitmap, null, false, WallpaperManager.FLAG_LOCK)
+            val homeCrop = Rect(0, 0, homeBitmap.width, homeBitmap.height)
+            val lockCrop = Rect(0, 0, lockBitmap.width, lockBitmap.height)
+            wm.setBitmap(homeBitmap, homeCrop, false, WallpaperManager.FLAG_SYSTEM)
+            wm.setBitmap(lockBitmap, lockCrop, false, WallpaperManager.FLAG_LOCK)
 
             cancelScheduledWork(context)
             true
@@ -105,7 +108,7 @@ object DefaultWallpaperManager {
         }
     }
 
-    private fun cancelScheduledWork(context: Context) {
+    fun cancelScheduledWork(context: Context) {
         try {
             val workManager = WorkManager.getInstance(context)
             workManager.cancelUniqueWork("AutoWallpaperWork_HOME")
@@ -123,9 +126,8 @@ object DefaultWallpaperManager {
         cancelScheduledWork(context)
     }
 
-    /** Turns the automation back on: re-schedules whatever the user had enabled. */
-    suspend fun resumeAll(context: Context) = withContext(Dispatchers.IO) {
-        setPaused(context, false)
+    /** Re-schedules whatever the user had enabled (static Home / Lock auto-change and live wallpaper cycling). */
+    suspend fun rescheduleEnabledWork(context: Context) = withContext(Dispatchers.IO) {
         try {
             val dao = AppDatabase.getDatabase(context).wallpaperConfigDao()
             for (screen in listOf(HOME, LOCK)) {
@@ -141,6 +143,28 @@ object DefaultWallpaperManager {
             LiveWallpaperWorker.scheduleWork(context)
         } catch (e: Exception) {
             Log.w(TAG, "Could not re-schedule live wallpaper work: ${e.message}")
+        }
+    }
+
+    /** Turns the automation back on: re-schedules whatever the user had enabled. */
+    suspend fun resumeAll(context: Context) = withContext(Dispatchers.IO) {
+        setPaused(context, false)
+        rescheduleEnabledWork(context)
+    }
+
+    /**
+     * Wallpaper changer switch-off used by the Quick Settings tile and the app: stops every wallpaper job and
+     * puts the default Home / Lock wallpapers on the phone (this also removes any live wallpaper, so the
+     * live wallpaper engine stops completely). When no defaults are chosen yet it only switches the changer off.
+     * Returns true when the defaults were applied.
+     */
+    suspend fun disableAndApplyDefaults(context: Context): Boolean = withContext(Dispatchers.IO) {
+        val hasDefaults = getDefaultFile(context, HOME) != null && getDefaultFile(context, LOCK) != null
+        if (hasDefaults && pauseAllAndApplyDefaults(context)) {
+            true
+        } else {
+            disableChanger(context)
+            false
         }
     }
 }

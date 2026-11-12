@@ -15,7 +15,7 @@ import kotlinx.coroutines.launch
  * Quick Settings switch for the whole wallpaper changer.
  * ON  = the changer works as set up in the app.
  * OFF = totally disabled: auto-change, schedules, the wallpaper tiles, gestures and live wallpaper
- *       cycling all do nothing. The wallpaper on the phone stays as it is.
+ *       cycling all stop, and the default Home / Lock wallpapers are applied (which also ends any live wallpaper).
  */
 class WallpaperChangerToggleTileService : TileService() {
 
@@ -39,11 +39,12 @@ class WallpaperChangerToggleTileService : TileService() {
                 DefaultWallpaperManager.resumeAll(context)
                 Toast.makeText(context, "Wallpaper changer is ON", Toast.LENGTH_SHORT).show()
             } else {
-                DefaultWallpaperManager.disableChanger(context)
+                val applied = DefaultWallpaperManager.disableAndApplyDefaults(context)
                 Toast.makeText(
                     context,
-                    "Wallpaper changer is OFF. Your current wallpaper stays as it is.",
-                    Toast.LENGTH_SHORT
+                    if (applied) "Wallpaper changer is OFF. Default wallpapers applied."
+                    else "Wallpaper changer is OFF. Choose default Home and Lock wallpapers in the Wallpaper screen to apply them.",
+                    Toast.LENGTH_LONG
                 ).show()
             }
             refreshTile()

@@ -29,6 +29,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
+import com.example.util.GameMode
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
 import android.text.TextUtils
@@ -51,7 +52,11 @@ import com.example.service.wallpaper.LiveWallpaperManager
 import com.example.data.AppDatabase
 import com.example.data.AutoClickConfigEntity
 import com.example.data.GestureActionEntity
+import com.example.data.NotchAreaGeometry
+import com.example.data.NotchAreas
 import com.example.data.NotchConfigEntity
+import com.example.data.toAreaGeometry
+import com.example.util.WebLinkHelper
 import com.example.data.NotchRepository
 import com.example.data.SideDeckConfigEntity
 import com.example.data.TextAssistantConfigEntity
@@ -67,6 +72,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.IntentFilter
+import com.example.util.QuietHours
 import android.net.ConnectivityManager
 import android.os.SystemClock
 import android.widget.RemoteViews
@@ -81,9 +87,6 @@ import androidx.compose.material.icons.filled.PowerOff
 import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material.icons.filled.WifiOff
-import com.example.ui.island.CapsuleType
-import com.example.ui.island.DynamicNotchManager
-import com.example.ui.island.MiniCapsuleEvent
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.launch
@@ -95,8 +98,6 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.setViewTreeLifecycleOwner
 import androidx.lifecycle.setViewTreeViewModelStoreOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
-import com.example.ui.island.DynamicIslandPill
-import com.example.ui.island.IslandState
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.height
@@ -171,13 +172,155 @@ class NotchAccessibilityService : AccessibilityService() {
                 Log.w(TAG, "Failed to request tile listening state", e)
             }
         }
+
+        fun executeActionExternal(action: GestureActionEntity): Boolean {
+            val s = instance ?: return false
+            s.executeAction(action)
+            return true
+        }
+
+        /**
+         * Shows (or hides) a visible marker on the real screen at the exact position of every notch gesture
+         * area, so the position can be seen while it is edited. [selectedAreaId] is highlighted.
+         * The marker hides itself if it is not refreshed for 90 seconds (e.g. the app was closed).
+         */
+        /** Slides the Quick Notes panel down from the top (used by the note editor after saving). */
+        fun openNotesPanel() {
+            val s = instance ?: return
+            s.handler.post { s.notesOverlay.show() }
+        }
+
+        fun setPositionPreview(enabled: Boolean, selectedAreaId: Int = 1) {
+            val s = instance ?: return
+            s.handler.post { s.applyPositionPreview(enabled, selectedAreaId) }
+        }
+    }
+
+    // ---- Live position preview (visible markers drawn over the notch gesture areas) ----
+    private class PreviewHolder(
+        val container: FrameLayout,
+        val label: android.widget.TextView,
+        val background: android.graphics.drawable.GradientDrawable
+    )
+
+    private val notesOverlay by lazy { NotesOverlay(this) }
+    private var tempLockRestoreRunnable: Runnable? = null
+
+    private val previewHolders = mutableMapOf<Int, PreviewHolder>()
+    private var previewEnabled = false
+    private var previewSelectedId = 1
+    private val previewTimeoutRunnable = Runnable { applyPositionPreview(false, previewSelectedId) }
+
+    private fun applyPositionPreview(enabled: Boolean, selectedId: Int) {
+        previewEnabled = enabled
+        previewSelectedId = selectedId
+        handler.removeCallbacks(previewTimeoutRunnable)
+        if (enabled) handler.postDelayed(previewTimeoutRunnable, 90_000L)
+        refreshPositionPreview()
+    }
+
+    private fun refreshPositionPreview() {
+        val geometries = if (previewEnabled) allAreaGeometries() else emptyList()
+
+        // Remove markers of areas that are gone (or everything when the preview is off)
+        val iterator = previewHolders.entries.iterator()
+        while (iterator.hasNext()) {
+            val entry = iterator.next()
+            if (geometries.none { it.id == entry.key }) {
+                try { windowManager.removeView(entry.value.container) } catch (_: Exception) {}
+                iterator.remove()
+            }
+        }
+
+        val density = resources.displayMetrics.density
+        for (g in geometries) {
+            val selected = g.id == previewSelectedId
+            val params = WindowManager.LayoutParams().apply {
+                width = areaWidthPx(g, density)
+                height = areaHeightPx(g, density)
+                type = WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
+                flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                format = PixelFormat.TRANSLUCENT
+                gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                x = (g.xOffsetDp * density).toInt()
+                y = (g.yOffsetDp * density).toInt()
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    layoutInDisplayCutoutMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                    } else {
+                        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                    }
+                }
+            }
+            val fill = if (selected) android.graphics.Color.argb(170, 255, 152, 0) else android.graphics.Color.argb(120, 79, 195, 247)
+            val stroke = if (selected) android.graphics.Color.WHITE else android.graphics.Color.argb(200, 255, 255, 255)
+            val radiusPx = g.cornerRadiusDp * density
+            val existing = previewHolders[g.id]
+            if (existing == null) {
+                val bg = android.graphics.drawable.GradientDrawable()
+                val label = android.widget.TextView(this).apply {
+                    gravity = Gravity.CENTER
+                    setTextColor(android.graphics.Color.WHITE)
+                    textSize = 12f
+                    setTypeface(typeface, android.graphics.Typeface.BOLD)
+                    text = "${g.id}"
+                }
+                val container = FrameLayout(this)
+                container.background = bg
+                container.addView(
+                    label,
+                    FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
+                )
+                bg.cornerRadius = radiusPx
+                bg.setColor(fill)
+                bg.setStroke((2 * density).toInt(), stroke)
+                try {
+                    windowManager.addView(container, params)
+                    previewHolders[g.id] = PreviewHolder(container, label, bg)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to add position preview", e)
+                }
+            } else {
+                existing.background.cornerRadius = radiusPx
+                existing.background.setColor(fill)
+                existing.background.setStroke((2 * density).toInt(), stroke)
+                try {
+                    windowManager.updateViewLayout(existing.container, params)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to update position preview", e)
+                }
+            }
+        }
     }
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private lateinit var windowManager: WindowManager
-    private var overlayContainer: FrameLayout? = null
-    private var overlayView: View? = null
-    private var overlayLifecycleOwner: ServiceOverlayLifecycleOwner? = null
+    /**
+     * One notch gesture area: its overlay window plus its own touch / gesture state machine, so the
+     * (up to 3) areas never interfere with each other.
+     */
+    private inner class NotchArea(var geometry: NotchAreaGeometry) {
+        var container: FrameLayout? = null
+        var view: View? = null
+
+        var startX = 0f
+        var startY = 0f
+        var isLongPressed = false
+        var isSwipeHoldTriggered = false
+        var currentSwipeHoldDirection: String? = null
+        var longPressRunnable: Runnable? = null
+        var swipeHoldRunnable: Runnable? = null
+        var tapCount = 0
+        var lastTapUpTime = 0L
+        var pendingTapRunnable: Runnable? = null
+    }
+
+    private val notchAreas = mutableListOf<NotchArea>()
+    private var extraAreaGeometries: List<NotchAreaGeometry> = emptyList()
 
     var autoClickEngine: com.example.service.AutoClickEngine? = null
         private set
@@ -211,24 +354,10 @@ class NotchAccessibilityService : AccessibilityService() {
     private var notchConfig = NotchConfigEntity()
     private var gestureActions = mapOf<String, GestureActionEntity>()
 
-    // Gesture detection variables
-    private var startX = 0f
-    private var startY = 0f
+    // Gesture detection settings (the per-area touch state lives in NotchArea)
     private val swipeThreshold = 50f
     private val handler = Handler(Looper.getMainLooper())
-
-    // Tap detection state machine
-    private var tapCount = 0
-    private var lastTapUpTime = 0L
     private val multiTapTimeout = 320L
-    private var pendingTapRunnable: Runnable? = null
-
-    // Long press and Swipe & Hold state machine
-    private var longPressRunnable: Runnable? = null
-    private var isLongPressed = false
-    private var swipeHoldRunnable: Runnable? = null
-    private var isSwipeHoldTriggered = false
-    private var currentSwipeHoldDirection: String? = null
     private val swipeHoldTimeout = 450L
 
     // Continuous repeating hold action for volume and brightness
@@ -258,164 +387,138 @@ class NotchAccessibilityService : AccessibilityService() {
         }
     }
 
-    private val capsuleSystemEventsReceiver = object : BroadcastReceiver() {
+    // ---- Night Battery Saver (whole app, sleeping time) ----
+    // During the sleeping window the Side Deck handle is removed and the Notch / Dynamic Island overlay is
+    // removed and the service stops receiving accessibility events. The wallpaper jobs are cancelled
+    // (see NightSaver). Everything returns by itself when the window ends.
+
+    private val nightSaverReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent == null || context == null) return
-            try {
-                if (!DynamicNotchManager.isDynamicNotchEnabled.value) return
-                val behavior = DynamicNotchManager.activeBehavior.value
-                when (intent.action) {
-                    Intent.ACTION_POWER_CONNECTED -> {
-                        if (behavior.batteryChargingStarted) {
-                            DynamicNotchManager.postCapsuleEvent(
-                                MiniCapsuleEvent(
-                                    type = CapsuleType.BATTERY_CHARGING_STARTED,
-                                    title = "Charging",
-                                    subtitle = "Fast Charger Connected",
-                                    iconVector = Icons.Default.BatteryChargingFull,
-                                    accentColor = androidx.compose.ui.graphics.Color(0xFF00E676),
-                                    durationSeconds = behavior.collapseAfterSeconds
-                                )
-                            )
-                        }
-                    }
-                    Intent.ACTION_POWER_DISCONNECTED -> {
-                        if (behavior.batteryChargingStopped) {
-                            DynamicNotchManager.postCapsuleEvent(
-                                MiniCapsuleEvent(
-                                    type = CapsuleType.BATTERY_CHARGING_STOPPED,
-                                    title = "Unplugged",
-                                    subtitle = "Running on Battery",
-                                    iconVector = Icons.Default.PowerOff,
-                                    accentColor = androidx.compose.ui.graphics.Color(0xFFFFA000),
-                                    durationSeconds = behavior.collapseAfterSeconds
-                                )
-                            )
-                        }
-                    }
-                    Intent.ACTION_BATTERY_LOW -> {
-                        if (behavior.batteryLowWarning) {
-                            DynamicNotchManager.postCapsuleEvent(
-                                MiniCapsuleEvent(
-                                    type = CapsuleType.BATTERY_LOW,
-                                    title = "Battery Low",
-                                    subtitle = "Connect Charger Soon",
-                                    iconVector = Icons.Default.BatteryAlert,
-                                    accentColor = androidx.compose.ui.graphics.Color(0xFFFF3D00),
-                                    durationSeconds = behavior.collapseAfterSeconds
-                                )
-                            )
-                        }
-                    }
-                    Intent.ACTION_HEADSET_PLUG -> {
-                        val state = intent.getIntExtra("state", -1)
-                        if (state == 1 && behavior.headphonesConnected) {
-                            DynamicNotchManager.postCapsuleEvent(
-                                MiniCapsuleEvent(
-                                    type = CapsuleType.HEADPHONES_CONNECTED,
-                                    title = "Headphones",
-                                    subtitle = "Audio Connected",
-                                    iconVector = Icons.Default.Headphones,
-                                    accentColor = androidx.compose.ui.graphics.Color(0xFFA855F7),
-                                    durationSeconds = behavior.collapseAfterSeconds
-                                )
-                            )
-                        } else if (state == 0 && behavior.headphonesDisconnected) {
-                            DynamicNotchManager.postCapsuleEvent(
-                                MiniCapsuleEvent(
-                                    type = CapsuleType.HEADPHONES_DISCONNECTED,
-                                    title = "Headphones",
-                                    subtitle = "Disconnected",
-                                    iconVector = Icons.Default.Headphones,
-                                    accentColor = androidx.compose.ui.graphics.Color(0xFF94A3B8),
-                                    durationSeconds = behavior.collapseAfterSeconds
-                                )
-                            )
-                        }
-                    }
-                    Intent.ACTION_AIRPLANE_MODE_CHANGED -> {
-                        val isAirplane = intent.getBooleanExtra("state", false)
-                        if (isAirplane && behavior.airplaneModeOn) {
-                            DynamicNotchManager.postCapsuleEvent(
-                                MiniCapsuleEvent(
-                                    type = CapsuleType.AIRPLANE_ON,
-                                    title = "Airplane Mode",
-                                    subtitle = "Radios Disabled",
-                                    iconVector = Icons.Default.AirplanemodeActive,
-                                    accentColor = androidx.compose.ui.graphics.Color(0xFFF59E0B),
-                                    durationSeconds = behavior.collapseAfterSeconds
-                                )
-                            )
-                        } else if (!isAirplane && behavior.airplaneModeOff) {
-                            DynamicNotchManager.postCapsuleEvent(
-                                MiniCapsuleEvent(
-                                    type = CapsuleType.AIRPLANE_OFF,
-                                    title = "Airplane Mode Off",
-                                    subtitle = "Reconnecting Networks",
-                                    iconVector = Icons.Default.AirplanemodeInactive,
-                                    accentColor = androidx.compose.ui.graphics.Color(0xFF10B981),
-                                    durationSeconds = behavior.collapseAfterSeconds
-                                )
-                            )
-                        }
-                    }
-                    @Suppress("DEPRECATION")
-                    ConnectivityManager.CONNECTIVITY_ACTION -> {
-                        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-                        @Suppress("DEPRECATION")
-                        val activeNet = cm?.activeNetworkInfo
-                        val isConnected = activeNet?.isConnected == true
-                        @Suppress("DEPRECATION")
-                        val isWifi = activeNet?.type == ConnectivityManager.TYPE_WIFI
-                        if (isConnected && isWifi && behavior.wifiConnected) {
-                            DynamicNotchManager.postCapsuleEvent(
-                                MiniCapsuleEvent(
-                                    type = CapsuleType.WIFI_CONNECTED,
-                                    title = "Wi-Fi Connected",
-                                    subtitle = "Online",
-                                    iconVector = Icons.Default.Wifi,
-                                    accentColor = androidx.compose.ui.graphics.Color(0xFF38BDF8),
-                                    durationSeconds = behavior.collapseAfterSeconds
-                                )
-                            )
-                        } else if (!isConnected && behavior.wifiDisconnected) {
-                            DynamicNotchManager.postCapsuleEvent(
-                                MiniCapsuleEvent(
-                                    type = CapsuleType.WIFI_DISCONNECTED,
-                                    title = "Wi-Fi Disconnected",
-                                    subtitle = "Offline",
-                                    iconVector = Icons.Default.WifiOff,
-                                    accentColor = androidx.compose.ui.graphics.Color(0xFFEF4444),
-                                    durationSeconds = behavior.collapseAfterSeconds
-                                )
-                            )
-                        }
-                    }
-                    AudioManager.RINGER_MODE_CHANGED_ACTION -> {
-                        if (behavior.volumeModeChanged) {
-                            val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-                            val ringerMode = am?.ringerMode ?: AudioManager.RINGER_MODE_NORMAL
-                            val subtitle = when (ringerMode) {
-                                AudioManager.RINGER_MODE_SILENT -> "Silent Mode"
-                                AudioManager.RINGER_MODE_VIBRATE -> "Vibrate Mode"
-                                else -> "Normal Sound"
-                            }
-                            DynamicNotchManager.postCapsuleEvent(
-                                MiniCapsuleEvent(
-                                    type = CapsuleType.VOLUME_CHANGED,
-                                    title = "Sound Mode",
-                                    subtitle = subtitle,
-                                    iconVector = Icons.Default.VolumeUp,
-                                    accentColor = androidx.compose.ui.graphics.Color(0xFF8B5CF6),
-                                    durationSeconds = behavior.collapseAfterSeconds
-                                )
-                            )
-                        }
-                    }
-                }
-            } catch (_: Exception) {
-                // Ignore receiver error
+            refreshNightSaverState()
+        }
+    }
+
+    private val nightSaverPrefsListener =
+        android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+            if (key != null && key.startsWith(QuietHours.NIGHT_SAVER)) {
+                handler.post { refreshNightSaverState() }
             }
+        }
+
+    @Volatile private var nightSuspended = false
+    @Volatile private var gameSuspended = false
+    private var imePackages: Set<String>? = null
+
+    private fun isSuspended(): Boolean = isNightSaverActive() || gameSuspended
+
+    /** Apps that may show on top of a game without the game being closed (status bar, keyboard...). */
+    private fun isIgnorableOverlayPackage(pkg: String): Boolean {
+        if (pkg == "android" || pkg == "com.android.systemui") return true
+        var ime = imePackages
+        if (ime == null) {
+            ime = try {
+                (getSystemService(Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager)
+                    .enabledInputMethodList.map { it.packageName }.toSet()
+            } catch (_: Exception) { emptySet() }
+            imePackages = ime
+        }
+        return ime.contains(pkg)
+    }
+
+    /** Game Mode: called for every window change; enters / leaves the game state. */
+    private fun checkGameForeground(pkgRaw: CharSequence?) {
+        val pkg = pkgRaw?.toString().orEmpty()
+        if (pkg.isEmpty()) return
+        if (!GameMode.isEnabled(this)) {
+            if (gameSuspended) setGameSuspended(false)
+            return
+        }
+        if (gameSuspended) {
+            if (pkg != currentGamePackage && !isIgnorableOverlayPackage(pkg)) setGameSuspended(false)
+        } else if (GameMode.isGame(this, pkg)) {
+            currentGamePackage = pkg
+            setGameSuspended(true)
+        }
+    }
+
+    private var currentGamePackage: String? = null
+
+    private fun setGameSuspended(value: Boolean) {
+        if (gameSuspended == value) return
+        gameSuspended = value
+        GameMode.active = value
+        if (!value) currentGamePackage = null
+        applySuspendState()
+    }
+
+    /** Settings of Game Mode changed in the app (switch or game list). */
+    fun onGameModeSettingsChanged() {
+        handler.post {
+            val stillGame = GameMode.isEnabled(this) && currentGamePackage?.let { GameMode.isGame(this, it) } == true
+            if (gameSuspended && !stillGame) setGameSuspended(false)
+        }
+    }
+
+    private fun isNightSaverActive(): Boolean =
+        com.example.util.NightSaver.isActive(this)
+
+    /** Screen on / time change / settings change: re-check; NightSaver.sync() does the rest when the state flipped. */
+    private fun refreshNightSaverState() {
+        com.example.util.NightSaver.sync(this)
+    }
+
+    /**
+     * Called by NightSaver when the sleeping window starts or ends (or its settings change).
+     * Start: overlays are REMOVED (not just hidden), auto click stops and the service stops receiving
+     * accessibility events at all. End: everything comes back by itself.
+     */
+    fun onNightSaverChanged() {
+        handler.post { applySuspendState() }
+    }
+
+    /** Applies "everything stopped" (night or game) or "everything running" to the overlays and events. */
+    private fun applySuspendState() {
+        handler.post {
+            nightSuspended = isNightSaverActive()
+            if (nightSuspended || gameSuspended) {
+                try { autoClickEngine?.stop(if (gameSuspended) "Game Mode" else "Night Battery Saver") } catch (_: Exception) {}
+                stopContinuousHoldAction()
+                stopInlineSpinner()
+                removeOverlay()
+                removeSideDeckHandle()
+                closeSideDeckPanel()
+            } else {
+                updateOverlay()
+                updateSideDeckHandle()
+                updateOverlayVisibility()
+            }
+            applyEventMask()
+        }
+    }
+
+    /**
+     * Only ask Android for the events that are really needed. Text events (every keystroke in every app) are
+     * requested only while the Text Assistant is on, and during the night nothing is requested at all.
+     */
+    private fun applyEventMask() {
+        try {
+            val info = serviceInfo ?: return
+            val wanted = when {
+                nightSuspended -> 0
+                // Game Mode: only window changes, so we notice when the game is closed
+                gameSuspended -> AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+                textAssistantConfig.enabled ->
+                    AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
+                        AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED or
+                        AccessibilityEvent.TYPE_VIEW_FOCUSED
+                else -> AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+            }
+            if (info.eventTypes != wanted) {
+                info.eventTypes = wanted
+                serviceInfo = info
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not update accessibility event mask: ${e.message}")
         }
     }
 
@@ -432,20 +535,20 @@ class NotchAccessibilityService : AccessibilityService() {
             registerReceiver(stopRecordingReceiver, filter)
         }
 
-        val capsuleFilter = IntentFilter().apply {
-            addAction(Intent.ACTION_POWER_CONNECTED)
-            addAction(Intent.ACTION_POWER_DISCONNECTED)
-            addAction(Intent.ACTION_BATTERY_LOW)
-            addAction(Intent.ACTION_HEADSET_PLUG)
-            addAction(Intent.ACTION_AIRPLANE_MODE_CHANGED)
-            @Suppress("DEPRECATION")
-            addAction(ConnectivityManager.CONNECTIVITY_ACTION)
-            addAction(AudioManager.RINGER_MODE_CHANGED_ACTION)
+        val sleepFilter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_TIME_CHANGED)
+            addAction(Intent.ACTION_TIMEZONE_CHANGED)
         }
         try {
-            registerReceiver(capsuleSystemEventsReceiver, capsuleFilter)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(nightSaverReceiver, sleepFilter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                registerReceiver(nightSaverReceiver, sleepFilter)
+            }
+            QuietHours.prefs(this).registerOnSharedPreferenceChangeListener(nightSaverPrefsListener)
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to register capsule receiver", e)
+            Log.e(TAG, "Failed to register Night Saver receiver", e)
         }
     }
 
@@ -454,12 +557,17 @@ class NotchAccessibilityService : AccessibilityService() {
         isRunning = true
         instance = this
         Log.d(TAG, "Service Connected")
-        DynamicNotchManager.initialize(this)
+        NotchAreas.init(this)
+        com.example.data.NotesStore.init(this)
+        scheduleTempLockRestoreCheck()
+        extraAreaGeometries = NotchAreas.extraAreas.value
         autoClickEngine = com.example.service.AutoClickEngine(this, repository, serviceScope)
 
         appPrefs = getSharedPreferences("app_prefs", android.content.Context.MODE_PRIVATE)
         notchMasterEnabled = appPrefs.getBoolean("notch_master_toggle", true)
         appPrefs.registerOnSharedPreferenceChangeListener(prefListener)
+        nightSuspended = isNightSaverActive()
+        applyEventMask()
 
         serviceScope.launch {
             // Ensure repository has default configuration
@@ -470,6 +578,14 @@ class NotchAccessibilityService : AccessibilityService() {
                 repository.configFlow.collectLatest { config ->
                     Log.d(TAG, "Config updated: $config")
                     notchConfig = config
+                    updateOverlay()
+                }
+            }
+
+            // Observe extra notch gesture areas (areas 2 and 3)
+            launch {
+                NotchAreas.extraAreas.collectLatest { areas ->
+                    extraAreaGeometries = areas
                     updateOverlay()
                 }
             }
@@ -496,6 +612,7 @@ class NotchAccessibilityService : AccessibilityService() {
                 repository.textAssistantConfigFlow.collectLatest { config ->
                     Log.d(TAG, "Text Assistant config updated: enabled=${config.enabled}, prefix=${config.triggerPrefix}")
                     textAssistantConfig = config
+                    applyEventMask()
                 }
             }
 
@@ -518,11 +635,23 @@ class NotchAccessibilityService : AccessibilityService() {
 
     override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
         super.onConfigurationChanged(newConfig)
+        if (nightSuspended || gameSuspended) return
         updateOverlayVisibility()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            checkGameForeground(event.packageName)
+            // Live wallpaper runs only on the home screen
+            event.packageName?.toString()?.let { pkg ->
+                com.example.service.wallpaper.LiveWallpaperGate.onForegroundPackage(
+                    this, pkg, isIgnorableOverlayPackage(pkg)
+                )
+            }
+        }
+        // Night Battery Saver / Game Mode: do nothing at all
+        if (nightSuspended || gameSuspended) return
 
         event.packageName?.toString()?.let { pkg ->
             if (pkg.isNotEmpty() && pkg != "android" && pkg != currentForegroundPackage) {
@@ -1069,10 +1198,17 @@ class NotchAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         super.onDestroy()
+        GameMode.active = false
+        com.example.service.wallpaper.LiveWallpaperGate.reset()
+        try { notesOverlay.destroy() } catch (_: Exception) {}
         isRunning = false
         if (instance == this) {
             instance = null
         }
+        handler.removeCallbacks(previewTimeoutRunnable)
+        previewEnabled = false
+        previewHolders.values.forEach { try { windowManager.removeView(it.container) } catch (_: Exception) {} }
+        previewHolders.clear()
         
         if (::appPrefs.isInitialized) {
             appPrefs.unregisterOnSharedPreferenceChangeListener(prefListener)
@@ -1094,7 +1230,8 @@ class NotchAccessibilityService : AccessibilityService() {
         }
 
         try {
-            unregisterReceiver(capsuleSystemEventsReceiver)
+            unregisterReceiver(nightSaverReceiver)
+            QuietHours.prefs(this).unregisterOnSharedPreferenceChangeListener(nightSaverPrefsListener)
         } catch (_: Exception) {}
 
         // Release recorders & cameras
@@ -1105,181 +1242,135 @@ class NotchAccessibilityService : AccessibilityService() {
         Log.d(TAG, "Service Destroyed")
     }
 
+    private fun cancelAreaCallbacks(area: NotchArea) {
+        area.longPressRunnable?.let { handler.removeCallbacks(it) }
+        area.swipeHoldRunnable?.let { handler.removeCallbacks(it) }
+        area.pendingTapRunnable?.let { handler.removeCallbacks(it) }
+        area.longPressRunnable = null
+        area.swipeHoldRunnable = null
+        area.pendingTapRunnable = null
+    }
+
     private fun removeOverlay() {
         stopContinuousHoldAction()
-        overlayContainer?.let { container ->
-            try {
-                windowManager.removeView(container)
-            } catch (e: Exception) {
-                Log.e(TAG, "Error removing overlay", e)
+        notchAreas.forEach { area ->
+            cancelAreaCallbacks(area)
+            area.container?.let { container ->
+                try {
+                    windowManager.removeView(container)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error removing overlay", e)
+                }
             }
+            area.container = null
+            area.view = null
         }
-        overlayLifecycleOwner?.let { owner ->
-            owner.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
-            owner.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
-            owner.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
-        }
-        overlayLifecycleOwner = null
-        overlayContainer = null
-        overlayView = null
+        notchAreas.clear()
     }
 
-    fun notifyDynamicNotchChanged() {
-        handler.post {
-            updateOverlay()
-        }
-    }
+    private fun allAreaGeometries(): List<NotchAreaGeometry> =
+        listOf(notchConfig.toAreaGeometry()) + extraAreaGeometries
+
+    private fun areaWidthPx(g: NotchAreaGeometry, density: Float): Int =
+        (g.widthDp * density).toInt().coerceAtLeast(60)
+
+    private fun areaHeightPx(g: NotchAreaGeometry, density: Float): Int =
+        (g.heightDp * density).toInt().coerceAtLeast(24)
 
     private fun updateOverlay() {
-        val isDynamicNotch = DynamicNotchManager.isDynamicNotchEnabled.value
-        val behavior = DynamicNotchManager.activeBehavior.value
-        val density = resources.displayMetrics.density
-        val widthPx = (notchConfig.widthDp * density).toInt().coerceAtLeast(60)
-        val heightPx = (notchConfig.heightDp * density).toInt().coerceAtLeast(24)
-        val xOffsetPx = (notchConfig.xOffsetDp * density).toInt()
-        val yOffsetPx = (notchConfig.yOffsetDp * density).toInt()
-
-        // Calculate dynamic dimensions ensuring full touchable area
-        val activeCapsule = DynamicNotchManager.currentCapsuleEvent.value ?: DynamicNotchManager.liveActivityEvent.value
-        val effectiveWidthPx = if (isDynamicNotch) {
-            if (activeCapsule != null) {
-                (240 * density).toInt().coerceAtLeast(widthPx)
-            } else {
-                widthPx.coerceAtLeast((140 * density).toInt())
-            }
-        } else {
-            widthPx
-        }
-        val effectiveHeightPx = if (isDynamicNotch) {
-            if (activeCapsule != null && activeCapsule.actionButtons.isNotEmpty()) {
-                (48 * density).toInt().coerceAtLeast(heightPx)
-            } else {
-                heightPx.coerceAtLeast((36 * density).toInt())
-            }
-        } else {
-            heightPx
+        if (isSuspended()) {
+            // Night Battery Saver: no overlay window while sleeping
+            removeOverlay()
+            return
         }
 
-        // Remove previous overlay before re-attaching
+        val geometries = allAreaGeometries()
+
+        // Nothing changed (e.g. only haptics were edited): keep the existing windows
+        if (notchAreas.size == geometries.size &&
+            notchAreas.indices.all { notchAreas[it].geometry == geometries[it] && notchAreas[it].container != null }
+        ) {
+            return
+        }
+
+        // Remove previous overlays before re-attaching
         removeOverlay()
 
-        val layoutParams = WindowManager.LayoutParams().apply {
-            width = effectiveWidthPx
-            height = effectiveHeightPx
-            type = WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
-            var flagMask = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-            flags = flagMask
-            format = PixelFormat.TRANSLUCENT
-            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-            x = xOffsetPx
-            y = yOffsetPx
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                layoutInDisplayCutoutMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
-                } else {
-                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        val density = resources.displayMetrics.density
+
+        geometries.forEach { geometry ->
+            val area = NotchArea(geometry)
+
+            val layoutParams = WindowManager.LayoutParams().apply {
+                width = areaWidthPx(geometry, density)
+                height = areaHeightPx(geometry, density)
+                type = WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
+                flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                format = PixelFormat.TRANSLUCENT
+                gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                x = (geometry.xOffsetDp * density).toInt()
+                y = (geometry.yOffsetDp * density).toInt()
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    layoutInDisplayCutoutMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                    } else {
+                        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                    }
                 }
             }
-        }
 
-        val newContainer = object : FrameLayout(this) {
-            init {
-                isClickable = true
-                isFocusable = false
-                clipChildren = false
-                clipToPadding = false
-            }
+            val newContainer = object : FrameLayout(this) {
+                init {
+                    isClickable = true
+                    isFocusable = false
+                    clipChildren = false
+                    clipToPadding = false
+                }
 
-            override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
-                if (isOverlayHidden) return false
-
-                // Process gesture touch event first so notch gestures always work even if dynamic notch is enabled
-                handleGestureTouchEvent(overlayView ?: this, ev)
-
-                // Also allow children (Compose action buttons) to receive touch events
-                try {
-                    super.dispatchTouchEvent(ev)
-                } catch (_: Exception) {}
-                return true
-            }
-        }
-
-        val lifecycleOwner = ServiceOverlayLifecycleOwner().apply {
-            performRestore(null)
-            handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
-            handleLifecycleEvent(Lifecycle.Event.ON_START)
-            handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
-        }
-        overlayLifecycleOwner = lifecycleOwner
-
-        // Set lifecycle and view tree owners on the root FrameLayout before children or WindowManager attach
-        newContainer.setViewTreeLifecycleOwner(lifecycleOwner)
-        newContainer.setViewTreeSavedStateRegistryOwner(lifecycleOwner)
-        newContainer.setViewTreeViewModelStoreOwner(lifecycleOwner)
-
-        val composeView = ComposeView(this).apply {
-            setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnDetachedFromWindow)
-            setViewTreeLifecycleOwner(lifecycleOwner)
-            setViewTreeSavedStateRegistryOwner(lifecycleOwner)
-            setViewTreeViewModelStoreOwner(lifecycleOwner)
-            setContent {
-                val isDynamic = DynamicNotchManager.isDynamicNotchEnabled.value
-                val skin = DynamicNotchManager.activeSkin.value
-                val currentBehavior = DynamicNotchManager.activeBehavior.value
-
-                if (isDynamic) {
-                    // Synchronize dimensions directly with calibrated notch position settings
-                    val alignedSkin = skin.copy(
-                        customWidthDp = notchConfig.widthDp,
-                        customHeightDp = notchConfig.heightDp,
-                        cornerRadiusDp = notchConfig.cornerRadiusDp
-                    )
-
-                    DynamicIslandPill(
-                        skin = alignedSkin,
-                        state = IslandState.COLLAPSED,
-                        behavior = currentBehavior,
-                        onStateChange = { /* Dynamic notch visual overlay is permanently unexpandable */ }
-                    )
-                } else {
-                    Box(
-                        modifier = Modifier
-                            .width(notchConfig.widthDp.dp)
-                            .height(notchConfig.heightDp.dp)
-                    )
+                override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+                    if (isOverlayHidden) return false
+                    handleGestureTouchEvent(area, ev)
+                    return true
                 }
             }
-        }
-        newContainer.addView(
-            composeView,
-            FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER)
-        )
-        overlayView = composeView
 
-        try {
-            windowManager.addView(newContainer, layoutParams)
-            overlayContainer = newContainer
-            Log.d(TAG, "Overlay added successfully: isDynamic=$isDynamicNotch w=$effectiveWidthPx h=$effectiveHeightPx y=$yOffsetPx")
-            updateOverlayVisibility()
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to add overlay window", e)
+            // Invisible touch surface used for the small press-feedback animation
+            val touchView = View(this)
+            newContainer.addView(
+                touchView,
+                FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
+            )
+            area.view = touchView
+
+            try {
+                windowManager.addView(newContainer, layoutParams)
+                area.container = newContainer
+                notchAreas.add(area)
+                Log.d(TAG, "Notch area ${geometry.id} added: w=${layoutParams.width} h=${layoutParams.height} x=${layoutParams.x} y=${layoutParams.y}")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to add notch area ${geometry.id} overlay window", e)
+            }
         }
+        updateOverlayVisibility()
+        refreshPositionPreview()
     }
 
-    private fun handleGestureTouchEvent(view: View, event: MotionEvent): Boolean {
+    private fun handleGestureTouchEvent(area: NotchArea, event: MotionEvent): Boolean {
         if (isOverlayHidden) {
             return false
         }
+        val view = area.view ?: return false
+        val areaId = area.geometry.id
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                startX = event.rawX
-                startY = event.rawY
-                isLongPressed = false
-                isSwipeHoldTriggered = false
-                currentSwipeHoldDirection = null
+                area.startX = event.rawX
+                area.startY = event.rawY
+                area.isLongPressed = false
+                area.isSwipeHoldTriggered = false
+                area.currentSwipeHoldDirection = null
                 stopContinuousHoldAction()
 
                 // Visual touch scale bounce feedback
@@ -1290,12 +1381,12 @@ class NotchAccessibilityService : AccessibilityService() {
                     .setInterpolator(OvershootInterpolator(1.2f))
                     .start()
 
-                swipeHoldRunnable?.let { handler.removeCallbacks(it) }
-                swipeHoldRunnable = null
+                area.swipeHoldRunnable?.let { handler.removeCallbacks(it) }
+                area.swipeHoldRunnable = null
 
-                longPressRunnable?.let { handler.removeCallbacks(it) }
-                longPressRunnable = Runnable {
-                    isLongPressed = true
+                area.longPressRunnable?.let { handler.removeCallbacks(it) }
+                area.longPressRunnable = Runnable {
+                    area.isLongPressed = true
                     vibrateFeedback()
                     view.animate()
                         .scaleX(1.20f)
@@ -1305,39 +1396,39 @@ class NotchAccessibilityService : AccessibilityService() {
                             view.animate().scaleX(1.10f).scaleY(1.10f).setDuration(100).start()
                         }
                         .start()
-                    triggerGestureAction("LONG_PRESS")
+                    triggerGestureAction(areaId, "LONG_PRESS")
                 }
-                handler.postDelayed(longPressRunnable!!, 500)
+                handler.postDelayed(area.longPressRunnable!!, 500)
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
-                if (isSwipeHoldTriggered) return true
+                if (area.isSwipeHoldTriggered) return true
 
-                val deltaX = event.rawX - startX
-                val deltaY = event.rawY - startY
+                val deltaX = event.rawX - area.startX
+                val deltaY = event.rawY - area.startY
 
                 view.translationX = (deltaX * 0.35f).coerceIn(-45f, 45f)
 
                 if (abs(deltaX) > swipeThreshold || abs(deltaY) > swipeThreshold) {
-                    longPressRunnable?.let { handler.removeCallbacks(it) }
+                    area.longPressRunnable?.let { handler.removeCallbacks(it) }
 
                     if (abs(deltaX) > abs(deltaY) && abs(deltaX) > swipeThreshold) {
                         val direction = if (deltaX > 0) "SWIPE_RIGHT_AND_HOLD" else "SWIPE_LEFT_AND_HOLD"
-                        if (currentSwipeHoldDirection != direction && !isSwipeHoldTriggered) {
-                            currentSwipeHoldDirection = direction
-                            swipeHoldRunnable?.let { handler.removeCallbacks(it) }
-                            swipeHoldRunnable = Runnable {
-                                isSwipeHoldTriggered = true
+                        if (area.currentSwipeHoldDirection != direction && !area.isSwipeHoldTriggered) {
+                            area.currentSwipeHoldDirection = direction
+                            area.swipeHoldRunnable?.let { handler.removeCallbacks(it) }
+                            area.swipeHoldRunnable = Runnable {
+                                area.isSwipeHoldTriggered = true
                                 view.animate().scaleX(1.20f).scaleY(1.20f).setDuration(120).start()
-                                triggerGestureAction(direction)
+                                triggerGestureAction(areaId, direction)
                             }
-                            handler.postDelayed(swipeHoldRunnable!!, swipeHoldTimeout)
+                            handler.postDelayed(area.swipeHoldRunnable!!, swipeHoldTimeout)
                         }
                     } else {
-                        if (!isSwipeHoldTriggered) {
-                            swipeHoldRunnable?.let { handler.removeCallbacks(it) }
-                            swipeHoldRunnable = null
-                            currentSwipeHoldDirection = null
+                        if (!area.isSwipeHoldTriggered) {
+                            area.swipeHoldRunnable?.let { handler.removeCallbacks(it) }
+                            area.swipeHoldRunnable = null
+                            area.currentSwipeHoldDirection = null
                         }
                     }
                 }
@@ -1353,71 +1444,73 @@ class NotchAccessibilityService : AccessibilityService() {
                     .start()
 
                 stopContinuousHoldAction()
-                longPressRunnable?.let { handler.removeCallbacks(it) }
-                swipeHoldRunnable?.let { handler.removeCallbacks(it) }
+                area.longPressRunnable?.let { handler.removeCallbacks(it) }
+                area.swipeHoldRunnable?.let { handler.removeCallbacks(it) }
 
-                if (isSwipeHoldTriggered) {
-                    isSwipeHoldTriggered = false
-                    currentSwipeHoldDirection = null
-                } else if (!isLongPressed) {
-                    val deltaX = event.rawX - startX
-                    val deltaY = event.rawY - startY
+                if (area.isSwipeHoldTriggered) {
+                    area.isSwipeHoldTriggered = false
+                    area.currentSwipeHoldDirection = null
+                } else if (!area.isLongPressed) {
+                    val deltaX = event.rawX - area.startX
+                    val deltaY = event.rawY - area.startY
 
                     if (abs(deltaX) > swipeThreshold && abs(deltaX) > abs(deltaY)) {
                         if (deltaX > 0) {
-                            triggerGestureAction("SWIPE_RIGHT")
+                            triggerGestureAction(areaId, "SWIPE_RIGHT")
                         } else {
-                            triggerGestureAction("SWIPE_LEFT")
+                            triggerGestureAction(areaId, "SWIPE_LEFT")
                         }
                     } else if (abs(deltaY) > swipeThreshold && abs(deltaY) > abs(deltaX)) {
                         if (deltaY > 0) {
-                            triggerGestureAction("SWIPE_DOWN")
+                            triggerGestureAction(areaId, "SWIPE_DOWN")
                         } else {
-                            triggerGestureAction("SWIPE_UP")
+                            triggerGestureAction(areaId, "SWIPE_UP")
                         }
                     } else if (abs(deltaX) <= swipeThreshold && abs(deltaY) <= swipeThreshold) {
                         val currentTime = System.currentTimeMillis()
-                        if (currentTime - lastTapUpTime < multiTapTimeout) {
-                            tapCount++
+                        if (currentTime - area.lastTapUpTime < multiTapTimeout) {
+                            area.tapCount++
                         } else {
-                            tapCount = 1
+                            area.tapCount = 1
                         }
-                        lastTapUpTime = currentTime
+                        area.lastTapUpTime = currentTime
 
-                        pendingTapRunnable?.let { handler.removeCallbacks(it) }
+                        area.pendingTapRunnable?.let { handler.removeCallbacks(it) }
 
                         // Only wait for extra taps when a double/triple tap action actually exists;
                         // otherwise the tap fires immediately instead of after the multi-tap window.
-                        val hasDoubleTap = gestureActions["DOUBLE_TAP"]?.let { it.actionType != "NONE" } == true
-                        val hasTripleTap = gestureActions["TRIPLE_TAP"]?.let { it.actionType != "NONE" } == true
+                        val hasDoubleTap = gestureActions[NotchAreas.actionKey(areaId, "DOUBLE_TAP")]
+                            ?.let { it.actionType != "NONE" } == true
+                        val hasTripleTap = gestureActions[NotchAreas.actionKey(areaId, "TRIPLE_TAP")]
+                            ?.let { it.actionType != "NONE" } == true
 
-                        if (tapCount >= 3) {
-                            tapCount = 0
-                            pendingTapRunnable = null
-                            triggerGestureAction("TRIPLE_TAP")
-                        } else if (tapCount == 1 && !hasDoubleTap && !hasTripleTap) {
-                            tapCount = 0
-                            pendingTapRunnable = null
-                            triggerGestureAction("SINGLE_TAP")
-                        } else if (tapCount == 2 && !hasTripleTap) {
-                            tapCount = 0
-                            pendingTapRunnable = null
-                            triggerGestureAction("DOUBLE_TAP")
+                        if (area.tapCount >= 3) {
+                            area.tapCount = 0
+                            area.pendingTapRunnable = null
+                            triggerGestureAction(areaId, "TRIPLE_TAP")
+                        } else if (area.tapCount == 1 && !hasDoubleTap && !hasTripleTap) {
+                            area.tapCount = 0
+                            area.pendingTapRunnable = null
+                            triggerGestureAction(areaId, "SINGLE_TAP")
+                        } else if (area.tapCount == 2 && !hasTripleTap) {
+                            area.tapCount = 0
+                            area.pendingTapRunnable = null
+                            triggerGestureAction(areaId, "DOUBLE_TAP")
                         } else {
-                            val currentCount = tapCount
-                            pendingTapRunnable = Runnable {
+                            val currentCount = area.tapCount
+                            area.pendingTapRunnable = Runnable {
                                 if (currentCount == 2) {
-                                    triggerGestureAction("DOUBLE_TAP")
+                                    triggerGestureAction(areaId, "DOUBLE_TAP")
                                 } else if (currentCount == 1) {
-                                    val singleTapAction = gestureActions["SINGLE_TAP"]
+                                    val singleTapAction = gestureActions[NotchAreas.actionKey(areaId, "SINGLE_TAP")]
                                     if (singleTapAction != null && singleTapAction.actionType != "NONE") {
-                                        triggerGestureAction("SINGLE_TAP")
+                                        triggerGestureAction(areaId, "SINGLE_TAP")
                                     }
                                 }
-                                tapCount = 0
-                                pendingTapRunnable = null
+                                area.tapCount = 0
+                                area.pendingTapRunnable = null
                             }
-                            handler.postDelayed(pendingTapRunnable!!, multiTapTimeout)
+                            handler.postDelayed(area.pendingTapRunnable!!, multiTapTimeout)
                         }
                     }
                 }
@@ -1433,12 +1526,10 @@ class NotchAccessibilityService : AccessibilityService() {
                     .start()
 
                 stopContinuousHoldAction()
-                longPressRunnable?.let { handler.removeCallbacks(it) }
-                swipeHoldRunnable?.let { handler.removeCallbacks(it) }
-                pendingTapRunnable?.let { handler.removeCallbacks(it) }
-                isSwipeHoldTriggered = false
-                currentSwipeHoldDirection = null
-                tapCount = 0
+                cancelAreaCallbacks(area)
+                area.isSwipeHoldTriggered = false
+                area.currentSwipeHoldDirection = null
+                area.tapCount = 0
                 return true
             }
         }
@@ -1490,11 +1581,11 @@ class NotchAccessibilityService : AccessibilityService() {
         continuousHoldRunnable = null
     }
 
-    private fun triggerGestureAction(gestureName: String) {
-        val actionEntity = gestureActions[gestureName] ?: return
+    private fun triggerGestureAction(areaId: Int, gestureName: String) {
+        val actionEntity = gestureActions[NotchAreas.actionKey(areaId, gestureName)] ?: return
         if (actionEntity.actionType == "NONE") return
 
-        Log.d(TAG, "Triggering gesture: $gestureName -> ${actionEntity.actionType}")
+        Log.d(TAG, "Triggering gesture: area $areaId $gestureName -> ${actionEntity.actionType}")
         vibrateFeedback()
 
         // Increment stats in background
@@ -1511,7 +1602,7 @@ class NotchAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun executeAction(action: GestureActionEntity) {
+    internal fun executeAction(action: GestureActionEntity) {
         when (action.actionType) {
             "BACK" -> performGlobalAction(GLOBAL_ACTION_BACK)
             "HOME" -> performGlobalAction(GLOBAL_ACTION_HOME)
@@ -1540,6 +1631,19 @@ class NotchAccessibilityService : AccessibilityService() {
             "CUSTOM_BRIGHTNESS" -> setCustomBrightness(action.extraValue?.toIntOrNull() ?: 50)
             "LAUNCH_APP" -> launchApp(action.packageToLaunch)
             "SHORTCUT" -> launchShortcut(action)
+            "OPEN_URL" -> openWebLink(action.extraValue)
+            "OPEN_NOTES" -> handler.post { notesOverlay.toggle() }
+            "QUICK_DIAL" -> quickDial(action.extraValue)
+            "TEMP_LOCK_WALLPAPER" -> startTempLockWallpaper(action.extraValue)
+            "TOGGLE_NOTCH" -> toggleNotchGestures()
+            "TOGGLE_SIDE_DECK" -> toggleAppFeature("SIDE_DECK")
+            "TOGGLE_OTP" -> toggleAppFeature("OTP")
+            "TOGGLE_TEXT_ASSISTANT" -> toggleAppFeature("TEXT_ASSISTANT")
+            "TOGGLE_EQUALIZER" -> toggleEqualizerAction()
+            "WALLPAPER_CHANGER_TOGGLE" -> toggleWallpaperChangerAction()
+            "LIVE_WALLPAPER_NEXT" -> nextLiveWallpaperAction()
+            "STOP_SPY_CAM" -> stopSpyCamAction()
+            "AUTOCLICK_MENU_TOGGLE" -> toggleAutoClickFloatingMenu()
             "AUTOCLICK_TOGGLE" -> toggleAutoClick()
             "AUTOCLICK_START" -> autoClickEngine?.start()
             "AUTOCLICK_STOP" -> autoClickEngine?.stop()
@@ -1551,6 +1655,181 @@ class NotchAccessibilityService : AccessibilityService() {
             "WALLPAPER_IMAGES_NEXT" -> cycleWallpaperAction("NEXT", sourceFilter = "IMAGES_ONLY")
             "WALLPAPER_FOLDER_NEXT" -> cycleWallpaperAction("NEXT", sourceFilter = "FOLDER_ONLY")
             else -> {}
+        }
+    }
+
+    private fun toastOnMain(message: String, long: Boolean = false) {
+        handler.post { Toast.makeText(this, message, if (long) Toast.LENGTH_LONG else Toast.LENGTH_SHORT).show() }
+    }
+
+    /** Same as the "Notch" quick tile: turns every notch gesture area on or off. */
+    private fun toggleNotchGestures() {
+        val newState = !appPrefs.getBoolean("notch_master_toggle", true)
+        appPrefs.edit().putBoolean("notch_master_toggle", newState).apply()
+        toastOnMain(if (newState) "Notch gestures are on" else "Notch gestures are off")
+    }
+
+    /** Same as the Side Deck, Code Detector and Text Assistant quick tiles: flips the feature on or off. */
+    private fun toggleAppFeature(feature: String) {
+        serviceScope.launch(Dispatchers.IO) {
+            val db = AppDatabase.getDatabase(applicationContext)
+            val name: String
+            val enabled: Boolean
+            when (feature) {
+                "SIDE_DECK" -> {
+                    val dao = db.sideDeckConfigDao()
+                    val config = dao.getConfigDirect() ?: return@launch
+                    enabled = !config.enabled
+                    dao.insertOrUpdateConfig(config.copy(enabled = enabled))
+                    name = "Side Deck"
+                }
+                "OTP" -> {
+                    val dao = db.codeDetectionDao()
+                    val config = dao.getConfigDirect() ?: return@launch
+                    enabled = !config.enabled
+                    dao.insertOrUpdateConfig(config.copy(enabled = enabled))
+                    name = "Code Detector"
+                }
+                else -> {
+                    val dao = db.textAssistantDao()
+                    val config = dao.getConfigDirect() ?: return@launch
+                    enabled = !config.enabled
+                    dao.insertOrUpdateConfig(config.copy(enabled = enabled))
+                    name = "Text Assistant"
+                }
+            }
+            toastOnMain(if (enabled) "$name is on" else "$name is off")
+        }
+    }
+
+    private fun toggleEqualizerAction() {
+        try {
+            val appContext = applicationContext
+            com.example.service.audio.EqualizerController.init(appContext)
+            com.example.service.audio.EqualizerController.toggle(appContext)
+            val on = com.example.service.audio.EqualizerController.state.value.enabled
+            toastOnMain(if (on) "Equalizer is on" else "Equalizer is off")
+        } catch (e: Exception) {
+            Log.e(TAG, "Equalizer toggle failed", e)
+        }
+    }
+
+    /** Same as the "Wallpaper Changer" quick tile. */
+    private fun toggleWallpaperChangerAction() {
+        serviceScope.launch {
+            val appContext = applicationContext
+            if (com.example.service.wallpaper.DefaultWallpaperManager.isPaused(appContext)) {
+                com.example.service.wallpaper.DefaultWallpaperManager.resumeAll(appContext)
+                toastOnMain("Wallpaper changer is on")
+            } else {
+                val applied = com.example.service.wallpaper.DefaultWallpaperManager.disableAndApplyDefaults(appContext)
+                toastOnMain(
+                    if (applied) "Wallpaper changer is off. Default wallpapers applied."
+                    else "Wallpaper changer is off. Choose default Home and Lock wallpapers in the Wallpaper screen to apply them.",
+                    long = true
+                )
+            }
+        }
+    }
+
+    /** Same as the "Live Wallpaper" quick tile: switches to the next live wallpaper. */
+    private fun nextLiveWallpaperAction() {
+        val appContext = applicationContext
+        if (com.example.service.wallpaper.DefaultWallpaperManager.isPaused(appContext)) {
+            toastOnMain("Wallpaper changer is off. Turn it on first.", long = true)
+            return
+        }
+        try {
+            val next = LiveWallpaperManager.cycleNextLiveWallpaper(appContext)
+            val wm = android.app.WallpaperManager.getInstance(appContext)
+            if (wm.wallpaperInfo?.packageName != packageName) {
+                toastOnMain("Live wallpaper set to ${next.title}. Confirm \"Set wallpaper\" to use it.", long = true)
+                startActivity(
+                    Intent(android.app.WallpaperManager.ACTION_CHANGE_LIVE_WALLPAPER).apply {
+                        putExtra(
+                            android.app.WallpaperManager.EXTRA_LIVE_WALLPAPER_COMPONENT,
+                            android.content.ComponentName(appContext, com.example.service.wallpaper.SkyLiveWallpaperService::class.java)
+                        )
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                )
+            } else {
+                toastOnMain("Live wallpaper changed to ${next.title}")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Live wallpaper change failed", e)
+            toastOnMain("Could not change the live wallpaper")
+        }
+    }
+
+    /** Same as the "Stop Recording" quick tile. */
+    private fun stopSpyCamAction() {
+        if (NotchAccessibilityService.isSilentRecording) {
+            if (NotchAccessibilityService.stopSilentRecording(this)) {
+                toastOnMain("Recording stopped and saved")
+            }
+        } else {
+            toastOnMain("No silent recording is running")
+        }
+    }
+
+    /** Calls the contact chosen for this gesture (dials directly when the phone permission is granted, else opens the dialer). */
+    private fun quickDial(number: String?) {
+        val clean = number?.trim().orEmpty()
+        if (clean.isEmpty()) {
+            handler.post { Toast.makeText(this, "No contact selected for this gesture", Toast.LENGTH_SHORT).show() }
+            return
+        }
+        val canCall = checkSelfPermission(android.Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED
+        try {
+            val intent = Intent(
+                if (canCall) Intent.ACTION_CALL else Intent.ACTION_DIAL,
+                Uri.fromParts("tel", clean, null)
+            ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(intent)
+        } catch (e: Exception) {
+            Log.e(TAG, "Quick dial failed", e)
+            handler.post { Toast.makeText(this, "Could not start the call", Toast.LENGTH_SHORT).show() }
+        }
+    }
+
+    /** Shows the chosen picture on the lock screen for 2 minutes, then brings the old lock screen back. */
+    private fun startTempLockWallpaper(imagePath: String?) {
+        serviceScope.launch {
+            val error = TempLockWallpaper.start(this@NotchAccessibilityService, imagePath)
+            if (error != null) {
+                Toast.makeText(this@NotchAccessibilityService, error, Toast.LENGTH_LONG).show()
+            } else {
+                Toast.makeText(this@NotchAccessibilityService, "Lock wallpaper changed for 2 minutes", Toast.LENGTH_SHORT).show()
+                scheduleTempLockRestoreCheck()
+            }
+        }
+    }
+
+    /** In-process timer for the way back (a WorkManager timer is the backup if the service restarts). */
+    private fun scheduleTempLockRestoreCheck() {
+        tempLockRestoreRunnable?.let { handler.removeCallbacks(it) }
+        tempLockRestoreRunnable = null
+        if (!TempLockWallpaper.isActive(this)) return
+        val delayMs = TempLockWallpaper.remainingMs(this)
+        val runnable = Runnable {
+            serviceScope.launch(Dispatchers.IO) { TempLockWallpaper.restoreNow(this@NotchAccessibilityService) }
+        }
+        tempLockRestoreRunnable = runnable
+        handler.postDelayed(runnable, delayMs + 500L)
+    }
+
+    /** Opens the web link set for a gesture in the phone's default browser. */
+    private fun openWebLink(url: String?) {
+        if (!WebLinkHelper.open(this, url)) {
+            handler.post {
+                val msg = if (WebLinkHelper.normalize(url) == null) {
+                    "No valid web link is set for this gesture"
+                } else {
+                    "No browser found to open the link"
+                }
+                Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+            }
         }
     }
 
@@ -1891,7 +2170,7 @@ class NotchAccessibilityService : AccessibilityService() {
     // ==========================================
 
     private fun updateSideDeckHandle() {
-        if (!sideDeckConfig.enabled) {
+        if (!sideDeckConfig.enabled || isSuspended()) {
             removeSideDeckHandle()
             closeSideDeckPanel()
             return
@@ -3033,59 +3312,36 @@ class NotchAccessibilityService : AccessibilityService() {
     }
 
     private fun applyOverlayVisibility() {
-        val isExcluded = isForegroundAppExcluded() || isCurrentWindowFullScreen() || !notchMasterEnabled
+        val isExcluded = isForegroundAppExcluded() || isCurrentWindowFullScreen() || !notchMasterEnabled || isSuspended()
         isOverlayHidden = isExcluded
         handler.post {
             try {
-                // Update Notch Overlay Container Layout Params
-                val overlay = overlayContainer
-                if (overlay != null) {
-                    val params = overlay.layoutParams as? WindowManager.LayoutParams
-                    if (params != null) {
-                        val density = resources.displayMetrics.density
-                        val widthPx = (notchConfig.widthDp * density).toInt()
-                        val heightPx = (notchConfig.heightDp * density).toInt()
-                        
-                        if (isExcluded) {
-                            if (params.width != 0 || params.height != 0) {
-                                params.width = 0
-                                params.height = 0
-                                params.flags = params.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                                overlay.visibility = View.GONE
-                                windowManager.updateViewLayout(overlay, params)
-                                Log.d(TAG, "Notch overlay hidden (excluded/fullscreen)")
-                            }
-                        } else {
-                            val isDynamic = DynamicNotchManager.isDynamicNotchEnabled.value
-                            val behavior = DynamicNotchManager.activeBehavior.value
-                            val activeCapsule = DynamicNotchManager.currentCapsuleEvent.value ?: DynamicNotchManager.liveActivityEvent.value
-                            val targetWidth = if (isDynamic) {
-                                if (activeCapsule != null) {
-                                    (240 * density).toInt().coerceAtLeast(widthPx)
-                                } else {
-                                    widthPx.coerceAtLeast((140 * density).toInt())
-                                }
-                            } else {
-                                widthPx
-                            }
-                            val targetHeight = if (isDynamic) {
-                                if (activeCapsule != null && activeCapsule.actionButtons.isNotEmpty()) {
-                                    (48 * density).toInt().coerceAtLeast(heightPx)
-                                } else {
-                                    heightPx.coerceAtLeast((36 * density).toInt())
-                                }
-                            } else {
-                                heightPx
-                            }
-                            val targetFlags = params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
-                            overlay.visibility = View.VISIBLE
-                            if (params.width != targetWidth || params.height != targetHeight || params.flags != targetFlags) {
-                                params.width = targetWidth
-                                params.height = targetHeight
-                                params.flags = targetFlags
-                                windowManager.updateViewLayout(overlay, params)
-                                Log.d(TAG, "Notch overlay restored (dynamic=$isDynamic w=$targetWidth h=$targetHeight)")
-                            }
+                // Update every notch gesture area's overlay window
+                val notchDensity = resources.displayMetrics.density
+                for (area in notchAreas) {
+                    val overlay = area.container ?: continue
+                    val params = overlay.layoutParams as? WindowManager.LayoutParams ?: continue
+
+                    if (isExcluded) {
+                        if (params.width != 0 || params.height != 0) {
+                            params.width = 0
+                            params.height = 0
+                            params.flags = params.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                            overlay.visibility = View.GONE
+                            windowManager.updateViewLayout(overlay, params)
+                            Log.d(TAG, "Notch area ${area.geometry.id} hidden (excluded/fullscreen)")
+                        }
+                    } else {
+                        val targetWidth = areaWidthPx(area.geometry, notchDensity)
+                        val targetHeight = areaHeightPx(area.geometry, notchDensity)
+                        val targetFlags = params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                        overlay.visibility = View.VISIBLE
+                        if (params.width != targetWidth || params.height != targetHeight || params.flags != targetFlags) {
+                            params.width = targetWidth
+                            params.height = targetHeight
+                            params.flags = targetFlags
+                            windowManager.updateViewLayout(overlay, params)
+                            Log.d(TAG, "Notch area ${area.geometry.id} restored (w=$targetWidth h=$targetHeight)")
                         }
                     }
                 }

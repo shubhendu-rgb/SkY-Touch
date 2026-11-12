@@ -13,7 +13,7 @@ import java.io.OutputStream
 object BackupHelper {
     private const val TAG = "BackupHelper"
 
-    suspend fun exportToString(repository: NotchRepository): String {
+    suspend fun exportToString(repository: NotchRepository, context: Context? = null): String {
         val root = JSONObject()
 
         // 1. Notch Config
@@ -47,6 +47,14 @@ object BackupHelper {
             actionsArray.put(actionJson)
         }
         root.put("gesture_actions", actionsArray)
+
+        // 2b. Extra notch gesture areas (areas 2 and 3); their actions are in gesture_actions as "A2_..." / "A3_..."
+        context?.let { NotchAreas.init(it) }
+        root.put("notch_extra_areas", JSONArray(NotchAreas.encode(NotchAreas.extraAreas.value)))
+
+        // 2c. Quick notes
+        context?.let { NotesStore.init(it) }
+        root.put("quick_notes", JSONArray(NotesStore.encode(NotesStore.notes.value)))
 
         // 3. Side Deck Config
         val sideDeckConfig = repository.getDirectSideDeckConfig()
@@ -123,7 +131,7 @@ object BackupHelper {
         return root.toString(4) // Pretty format with 4 space indentation
     }
 
-    suspend fun importFromString(repository: NotchRepository, jsonStr: String): Boolean {
+    suspend fun importFromString(repository: NotchRepository, jsonStr: String, context: Context? = null): Boolean {
         try {
             val root = JSONObject(jsonStr)
 
@@ -162,6 +170,16 @@ object BackupHelper {
                     )
                     repository.updateAction(action)
                 }
+            }
+
+            // 2b. Extra notch gesture areas
+            if (context != null && root.has("notch_extra_areas")) {
+                NotchAreas.replaceAll(context, NotchAreas.decode(root.getJSONArray("notch_extra_areas").toString()))
+            }
+
+            // 2c. Quick notes
+            if (context != null && root.has("quick_notes")) {
+                NotesStore.replaceAll(context, NotesStore.decode(root.getJSONArray("quick_notes").toString()))
             }
 
             // 3. Side Deck Config

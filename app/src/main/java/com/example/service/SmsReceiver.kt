@@ -25,6 +25,7 @@ import kotlinx.coroutines.launch
 class SmsReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != "android.provider.Telephony.SMS_RECEIVED") return
+        if (com.example.util.GameMode.isActive()) return // Game Mode: everything stopped
 
         val pendingResult = goAsync()
         CoroutineScope(Dispatchers.IO).launch {
@@ -86,15 +87,6 @@ class SmsReceiver : BroadcastReceiver() {
                     )
                     repository.insertDetectedCode(detectedEntity)
 
-                    if (config.showNotification) {
-                        OtpNotificationHelper.postOtpNotification(
-                            context = context,
-                            code = result.code,
-                            sourcePackage = "android.provider.Telephony",
-                            snippet = "SMS from $senderAddress: ${result.contextSnippet}"
-                        )
-                    }
-
                     if (config.autoCopyToClipboard) {
                         val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                         val clip = ClipData.newPlainText("SMS Verification Code", result.code)
@@ -112,6 +104,17 @@ class SmsReceiver : BroadcastReceiver() {
                             "Detected SMS OTP: ${result.code}"
                         }
                         Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+                    }
+
+                    // Notification appears 2 seconds after detection (latest code only). The
+                    // receiver stays alive (goAsync) until it has been shown or replaced.
+                    if (config.showNotification) {
+                        OtpNotificationHelper.postOtpNotificationDelayed(
+                            context = context,
+                            code = result.code,
+                            sourcePackage = "android.provider.Telephony",
+                            snippet = "SMS from $senderAddress: ${result.contextSnippet}"
+                        )
                     }
                 }
             } catch (_: Exception) {
